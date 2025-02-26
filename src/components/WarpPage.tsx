@@ -6,9 +6,14 @@ import { IS_WARP_LOCAL } from '#root/utils/constants.ts';
 const FRAME_WIDTH = 512;
 const FRAME_HEIGHT = 512;
 const FRAME_RATE = 1;
+const INITIAL_PROMPT = "a mischievous cat with a third eye, matte pastel colour pallete in a cartoon style";
 
 const buildWebsocketUrlFromPodId = (podId: string) => {
-  return `ws://172.18.81.216:8765`;
+  return `ws://192.168.1.113:8765`;
+};
+
+const buildPromptEndpointUrlFromPodId = (podId: string) => {
+  return `http://192.168.1.113:5556/prompt/`;
 };
 
 const WarpPage = () => {
@@ -24,6 +29,21 @@ const WarpPage = () => {
   const frameQueueRef = useRef<HTMLImageElement[]>([]);
   const lastWarpedFrameRenderTimeRef = useRef<number | null>(null);
   const isStreamingRef = useRef(true);
+
+  // Send initial prompt when warp is ready
+  useEffect(() => {
+    if (warp?.podId && warp.podStatus === 'RUNNING') {
+      const promptEndpointUrl = buildPromptEndpointUrlFromPodId(warp.podId);
+      const encodedPrompt = encodeURIComponent(INITIAL_PROMPT);
+      const endpoint = `${promptEndpointUrl}${encodedPrompt}`;
+
+      fetch(endpoint, {
+        method: 'POST',
+      }).catch(error => {
+        console.error('Error sending initial prompt:', error);
+      });
+    }
+  }, [warp?.podId, warp?.podStatus]);
 
   // Initialize webcam
   useEffect(() => {
@@ -54,6 +74,8 @@ const WarpPage = () => {
   // Initialize warp
   useEffect(() => {
     const initializeWarp = async () => {
+      if (!getToken) return;
+      
       const token = await getToken();
       const response = await fetch(createFullEndpoint(`warps`), {
         method: 'POST',
@@ -78,7 +100,7 @@ const WarpPage = () => {
     } else {
       setWarp({ id: 'local', podId: 'local', podStatus: 'RUNNING' });
     }
-  }, []);
+  }, [getToken]);
 
   // Render frames
   useEffect(() => {
