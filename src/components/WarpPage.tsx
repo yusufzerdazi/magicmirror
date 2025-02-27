@@ -10,7 +10,7 @@ const INITIAL_PROMPT = "a mischievous cat with a third eye, matte pastel colour 
 const INITIAL_RETRY_DELAY = 1000;
 const MAX_RETRY_DELAY = 30000;
 const BACKOFF_FACTOR = 1.5;
-const FRAME_INTERVAL = 1000; // Send 1 frame per second
+const FRAME_INTERVAL = 250; // Send 4 frames per second
 
 const buildWebsocketUrlFromPodId = (podId: string) => {
   return `ws://192.168.1.113:8765`;
@@ -243,8 +243,15 @@ const WarpPage = () => {
     if (!croppedCtx) return;
 
     let frameInterval: NodeJS.Timeout;
+    let lastFrameTime = 0;
 
     const sendFrame = async () => {
+      const now = Date.now();
+      // Ensure we maintain consistent timing
+      if (now - lastFrameTime < FRAME_INTERVAL) {
+        return;
+      }
+
       if (videoRef.current && wsStatus === 'connected') {
         croppedCtx.drawImage(videoRef.current, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
         
@@ -253,6 +260,7 @@ const WarpPage = () => {
             if (blob && socketRef?.current?.readyState === WebSocket.OPEN) {
               blob.arrayBuffer().then(buffer => {
                 socketRef?.current?.send(buffer);
+                lastFrameTime = now;
               });
             }
           },
@@ -262,8 +270,8 @@ const WarpPage = () => {
       }
     };
 
-    // Set up interval for frame sending
-    frameInterval = setInterval(sendFrame, FRAME_INTERVAL);
+    // Use a shorter interval to ensure smooth timing
+    frameInterval = setInterval(sendFrame, FRAME_INTERVAL / 2);
 
     // Handle pings from server
     const handlePing = () => {
