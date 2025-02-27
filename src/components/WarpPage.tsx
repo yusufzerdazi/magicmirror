@@ -5,12 +5,13 @@ import { IS_WARP_LOCAL } from '#root/utils/constants.ts';
 
 const FRAME_WIDTH = 512;
 const FRAME_HEIGHT = 512;
-const FRAME_RATE = 1;
 const INITIAL_PROMPT = "a mischievous cat with a third eye, matte pastel colour pallete in a cartoon style";
 const INITIAL_RETRY_DELAY = 1000;
 const MAX_RETRY_DELAY = 30000;
 const BACKOFF_FACTOR = 1.5;
 const FRAME_INTERVAL = 250; // Send 4 frames per second
+const MAX_BUFFER_SIZE = 16; // Don't let buffer grow too large
+const DISPLAY_DURATION = 0; // Time to show each frame before transition
 
 const buildWebsocketUrlFromPodId = (podId: string) => {
   return `ws://192.168.1.113:8765`;
@@ -28,13 +29,12 @@ const WarpPage = () => {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const croppedCanvasRef = useRef<HTMLCanvasElement>(null);
-  const frontCanvasRef = useRef<HTMLCanvasElement>(null);
-  const backCanvasRef = useRef<HTMLCanvasElement>(null);
+  const currentCanvasRef = useRef<HTMLCanvasElement>(null);
+  const nextCanvasRef = useRef<HTMLCanvasElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const frameQueueRef = useRef<HTMLImageElement[]>([]);
-  const lastWarpedFrameRenderTimeRef = useRef<number | null>(null);
-  const isStreamingRef = useRef(true);
-  const [isTransitioning, setIsTransitioning] = useState(false);
+  const isTransitioningRef = useRef(false);
+  const lastTransitionTime = useRef(Date.now());
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
 
@@ -110,55 +110,79 @@ const WarpPage = () => {
     }
   }, [getToken]);
 
-  // Render frames
+  // Frame display logic
   useEffect(() => {
     if (!isRendering) return;
 
-    const renderFrame = () => {
-      if (frameQueueRef?.current?.length > 0 && !isTransitioning) {
-        const [img, ...remainingFrames] = frameQueueRef.current;
-        frameQueueRef.current = remainingFrames;
+    const displayNextFrame = () => {
+      const now = Date.now();
+      const timeSinceLastTransition = now - lastTransitionTime.current;
 
-        if (img && frontCanvasRef.current && backCanvasRef.current) {
-          // Draw new frame on back canvas first
-          const backCtx = backCanvasRef.current.getContext('2d');
-          if (backCtx) {
-            backCtx.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
-            backCtx.drawImage(img, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
-            backCanvasRef.current.style.opacity = '1'; // Ensure back canvas is fully visible
-            
-            setIsTransitioning(true);
+      // Check if it's time for next frame and we have frames to show
+      if (!isTransitioningRef.current && 
+          frameQueueRef.current.length > 0 && 
+          timeSinceLastTransition >= DISPLAY_DURATION) {
 
-            // Wait before starting the fade
-            setTimeout(() => {
-              let opacity = 1;
-              const fadeStep = 0.02;
-              const fade = () => {
-                if (opacity > 0) {
-                  opacity -= fadeStep;
-                  frontCanvasRef.current!.style.opacity = opacity.toString();
-                  requestAnimationFrame(fade);
-                } else {
-                  // Move the back canvas content to the front canvas
-                  const frontCtx = frontCanvasRef.current!.getContext('2d');
-                  if (frontCtx) {
-                    frontCtx.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
-                    frontCtx.drawImage(backCanvasRef.current!, 0, 0);
-                    frontCanvasRef.current!.style.opacity = '1';
-                  }
-                  setIsTransitioning(false);
-                }
-              };
+        // Skip frames if queue is getting too large
+        if (frameQueueRef.current.length > MAX_BUFFER_SIZE / 2) {
+          // Keep the most recent frames and discard older ones
+          const framesToSkip = Math.floor(frameQueueRef.current.length / 2);
+          frameQueueRef.current = frameQueueRef.current.slice(framesToSkip);
+        }
+
+        const nextFrame = frameQueueRef.current[0];
+        
+        // Prepare next frame
+        const nextCanvas = nextCanvasRef.current;
+        const nextCtx = nextCanvas?.getContext('2d');
+        
+        if (nextFrame && nextCtx && nextCanvas) {
+          // Draw next frame on bottom canvas
+          nextCtx.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+          nextCtx.drawImage(nextFrame, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+          
+          // Start transition
+          isTransitioningRef.current = true;
+          let opacity = 1;
+          
+          const fade = () => {
+            if (opacity > 0 && currentCanvasRef.current) {
+              opacity -= 0.05; // 20 steps for smooth fade
+              currentCanvasRef.current.style.opacity = opacity.toString();
               requestAnimationFrame(fade);
-            }, 500);
-          }
+            } else {
+              // Transition complete - swap canvases and update z-indices
+              const temp = currentCanvasRef.current;
+              currentCanvasRef.current = nextCanvasRef.current;
+              nextCanvasRef.current = temp;
+
+              // Update z-indices to keep current canvas on top
+              if (currentCanvasRef.current) {
+                currentCanvasRef.current.style.zIndex = '2';
+                currentCanvasRef.current.style.opacity = '1';
+              }
+              if (nextCanvasRef.current) {
+                nextCanvasRef.current.style.zIndex = '1';
+                nextCanvasRef.current.style.opacity = '1';
+              }
+              
+              // Remove displayed frame from queue
+              frameQueueRef.current = frameQueueRef.current.slice(1);
+              
+              lastTransitionTime.current = Date.now();
+              isTransitioningRef.current = false;
+            }
+          };
+
+          requestAnimationFrame(fade);
         }
       }
-      requestAnimationFrame(renderFrame);
+
+      requestAnimationFrame(displayNextFrame);
     };
 
-    renderFrame();
-  }, [isRendering, isTransitioning]);
+    displayNextFrame();
+  }, [isRendering]);
 
   // WebSocket connection
   useEffect(() => {
@@ -186,7 +210,10 @@ const WarpPage = () => {
         const img = new Image();
         img.onload = () => {
           URL.revokeObjectURL(url);
-          frameQueueRef.current = [...frameQueueRef.current, img];
+          // Only add to queue if we haven't exceeded MAX_BUFFER_SIZE
+          if (frameQueueRef.current.length < MAX_BUFFER_SIZE) {
+            frameQueueRef.current = [...frameQueueRef.current, img];
+          }
         };
         img.src = url;
       };
@@ -299,7 +326,9 @@ const WarpPage = () => {
         ref={videoRef}
         autoPlay
         playsInline
-        className={`absolute inset-0 w-full h-full object-cover ${frameQueueRef.current.length > 0 ? 'hidden' : ''}`}
+        className={`absolute inset-0 w-full h-full object-cover ${
+          frameQueueRef.current.length > 0 ? 'hidden' : ''
+        }`}
       />
       <canvas
         ref={croppedCanvasRef}
@@ -308,18 +337,18 @@ const WarpPage = () => {
         className="hidden"
       />
       <canvas
-        ref={backCanvasRef}
+        ref={nextCanvasRef}
         width={FRAME_WIDTH}
         height={FRAME_HEIGHT}
         className="absolute inset-0 w-full h-full object-cover"
-        style={{ opacity: 1, zIndex: 1 }}
+        style={{ zIndex: 1 }}
       />
       <canvas
-        ref={frontCanvasRef}
+        ref={currentCanvasRef}
         width={FRAME_WIDTH}
         height={FRAME_HEIGHT}
         className="absolute inset-0 w-full h-full object-cover"
-        style={{ opacity: 1, zIndex: 2 }}
+        style={{ zIndex: 2 }}
       />
     </div>
   );
