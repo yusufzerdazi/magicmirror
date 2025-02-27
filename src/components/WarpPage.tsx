@@ -24,11 +24,15 @@ const WarpPage = () => {
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const croppedCanvasRef = useRef<HTMLCanvasElement>(null);
-  const processedCanvasRef = useRef<HTMLCanvasElement>(null);
+  const frontCanvasRef = useRef<HTMLCanvasElement>(null);
+  const backCanvasRef = useRef<HTMLCanvasElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const frameQueueRef = useRef<HTMLImageElement[]>([]);
   const lastWarpedFrameRenderTimeRef = useRef<number | null>(null);
   const isStreamingRef = useRef(true);
+  const [isTransitioning, setIsTransitioning] = useState(false);
+  const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
 
   // Send initial prompt when warp is ready
   useEffect(() => {
@@ -107,57 +111,117 @@ const WarpPage = () => {
     if (!isRendering) return;
 
     const renderFrame = () => {
-      const now = Date.now();
-      const processedCanvas = processedCanvasRef.current;
-      if (!processedCanvas) return;
-
-      const processedCtx = processedCanvas.getContext('2d');
-      if (!processedCtx) return;
-
-      if (frameQueueRef?.current?.length > 0) {
+      if (frameQueueRef?.current?.length > 0 && !isTransitioning) {
         const [img, ...remainingFrames] = frameQueueRef.current;
         frameQueueRef.current = remainingFrames;
 
-        if (img) {
-          processedCtx.drawImage(img, 0, 0, window.innerWidth, window.innerHeight);
+        if (img && frontCanvasRef.current && backCanvasRef.current) {
+          // Draw new frame on back canvas first
+          const backCtx = backCanvasRef.current.getContext('2d');
+          if (backCtx) {
+            backCtx.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+            backCtx.drawImage(img, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+            backCanvasRef.current.style.opacity = '1'; // Ensure back canvas is fully visible
+            
+            setIsTransitioning(true);
+
+            // Wait before starting the fade
+            setTimeout(() => {
+              let opacity = 1;
+              const fadeStep = 0.02;
+              const fade = () => {
+                if (opacity > 0) {
+                  opacity -= fadeStep;
+                  frontCanvasRef.current!.style.opacity = opacity.toString();
+                  requestAnimationFrame(fade);
+                } else {
+                  // Move the back canvas content to the front canvas
+                  const frontCtx = frontCanvasRef.current!.getContext('2d');
+                  if (frontCtx) {
+                    frontCtx.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+                    frontCtx.drawImage(backCanvasRef.current!, 0, 0);
+                    frontCanvasRef.current!.style.opacity = '1';
+                  }
+                  setIsTransitioning(false);
+                }
+              };
+              requestAnimationFrame(fade);
+            }, 500);
+          }
         }
-        lastWarpedFrameRenderTimeRef.current = now;
       }
       requestAnimationFrame(renderFrame);
     };
 
     renderFrame();
-  }, [isRendering]);
+  }, [isRendering, isTransitioning]);
 
   // WebSocket connection
   useEffect(() => {
     if (!warp?.podId || warp.podStatus !== 'RUNNING') return;
 
-    const websocketUrl = buildWebsocketUrlFromPodId(warp.podId);
-    const socket = new WebSocket(websocketUrl);
-    socket.binaryType = 'arraybuffer';
+    const connectWebSocket = () => {
+      setWsStatus('connecting');
+      const websocketUrl = buildWebsocketUrlFromPodId(warp.podId);
+      const socket = new WebSocket(websocketUrl);
+      socket.binaryType = 'arraybuffer';
 
-    socket.onmessage = event => {
-      const blob = new Blob([event.data], { type: 'image/jpeg' });
-      const url = URL.createObjectURL(blob);
-      const img = new Image();
-      img.onload = () => {
-        URL.revokeObjectURL(url);
-        frameQueueRef.current = [...frameQueueRef.current, img];
+      socket.onopen = () => {
+        setWsStatus('connected');
+        console.log('WebSocket connected');
       };
-      img.src = url;
+
+      socket.onmessage = event => {
+        const blob = new Blob([event.data], { type: 'image/jpeg' });
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => {
+          URL.revokeObjectURL(url);
+          frameQueueRef.current = [...frameQueueRef.current, img];
+        };
+        img.src = url;
+      };
+
+      socket.onclose = () => {
+        setWsStatus('disconnected');
+        console.log('WebSocket disconnected, attempting to reconnect...');
+        
+        // Clear any existing reconnection timeout
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+        }
+        
+        // Attempt to reconnect after 2 seconds
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (socketRef.current?.readyState === WebSocket.CLOSED) {
+            connectWebSocket();
+          }
+        }, 2000);
+      };
+
+      socket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+        socket.close(); // This will trigger onclose and attempt reconnection
+      };
+
+      socketRef.current = socket;
     };
 
-    socketRef.current = socket;
+    connectWebSocket();
 
     return () => {
-      socket.close();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (socketRef.current) {
+        socketRef.current.close();
+      }
     };
   }, [warp?.podId, warp?.podStatus]);
 
   // Send frames
   useEffect(() => {
-    if (!currentStream || !socketRef.current) return;
+    if (!currentStream || !socketRef.current || wsStatus !== 'connected') return;
 
     const videoTrack = currentStream.getVideoTracks()?.[0];
     if (!videoTrack) return;
@@ -171,7 +235,7 @@ const WarpPage = () => {
     let animationFrameId: number;
 
     const sendFrame = async () => {
-      if (videoRef.current) {
+      if (videoRef.current && wsStatus === 'connected') {
         croppedCtx.drawImage(videoRef.current, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
         
         croppedCanvas.toBlob(
@@ -194,10 +258,15 @@ const WarpPage = () => {
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [currentStream]);
+  }, [currentStream, wsStatus]);
 
   return (
     <div className="fixed inset-0 bg-black">
+      {wsStatus !== 'connected' && (
+        <div className="absolute top-4 right-4 z-10 px-4 py-2 rounded-full bg-black/50 text-white">
+          {wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...'}
+        </div>
+      )}
       <video
         ref={videoRef}
         autoPlay
@@ -211,10 +280,18 @@ const WarpPage = () => {
         className="hidden"
       />
       <canvas
-        ref={processedCanvasRef}
+        ref={backCanvasRef}
         width={FRAME_WIDTH}
         height={FRAME_HEIGHT}
-        className={`absolute inset-0 w-full h-full object-cover ${frameQueueRef.current.length === 0 ? 'hidden' : ''}`}
+        className="absolute inset-0 w-full h-full object-cover"
+        style={{ opacity: 1, zIndex: 1 }}
+      />
+      <canvas
+        ref={frontCanvasRef}
+        width={FRAME_WIDTH}
+        height={FRAME_HEIGHT}
+        className="absolute inset-0 w-full h-full object-cover"
+        style={{ opacity: 1, zIndex: 2 }}
       />
     </div>
   );
