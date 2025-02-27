@@ -7,6 +7,10 @@ const FRAME_WIDTH = 512;
 const FRAME_HEIGHT = 512;
 const FRAME_RATE = 1;
 const INITIAL_PROMPT = "a mischievous cat with a third eye, matte pastel colour pallete in a cartoon style";
+const INITIAL_RETRY_DELAY = 1000;
+const MAX_RETRY_DELAY = 30000;
+const BACKOFF_FACTOR = 1.5;
+const FRAME_INTERVAL = 1000; // Send 1 frame per second
 
 const buildWebsocketUrlFromPodId = (podId: string) => {
   return `ws://192.168.1.113:8765`;
@@ -160,6 +164,9 @@ const WarpPage = () => {
   useEffect(() => {
     if (!warp?.podId || warp.podStatus !== 'RUNNING') return;
 
+    let retryCount = 0;
+    let retryDelay = INITIAL_RETRY_DELAY;
+
     const connectWebSocket = () => {
       setWsStatus('connecting');
       const websocketUrl = buildWebsocketUrlFromPodId(warp.podId);
@@ -169,6 +176,8 @@ const WarpPage = () => {
       socket.onopen = () => {
         setWsStatus('connected');
         console.log('WebSocket connected');
+        retryCount = 0;
+        retryDelay = INITIAL_RETRY_DELAY;
       };
 
       socket.onmessage = event => {
@@ -184,24 +193,25 @@ const WarpPage = () => {
 
       socket.onclose = () => {
         setWsStatus('disconnected');
-        console.log('WebSocket disconnected, attempting to reconnect...');
+        console.log(`WebSocket disconnected (attempt ${retryCount + 1})`);
         
-        // Clear any existing reconnection timeout
         if (reconnectTimeoutRef.current) {
           clearTimeout(reconnectTimeoutRef.current);
         }
+
+        // Calculate next retry delay with exponential backoff
+        retryDelay = Math.min(retryDelay * BACKOFF_FACTOR, MAX_RETRY_DELAY);
+        retryCount++;
         
-        // Attempt to reconnect after 2 seconds
         reconnectTimeoutRef.current = setTimeout(() => {
           if (socketRef.current?.readyState === WebSocket.CLOSED) {
             connectWebSocket();
           }
-        }, 2000);
+        }, retryDelay);
       };
 
       socket.onerror = (error) => {
         console.error('WebSocket error:', error);
-        socket.close(); // This will trigger onclose and attempt reconnection
       };
 
       socketRef.current = socket;
@@ -232,7 +242,7 @@ const WarpPage = () => {
     const croppedCtx = croppedCanvas.getContext('2d');
     if (!croppedCtx) return;
 
-    let animationFrameId: number;
+    let frameInterval: NodeJS.Timeout;
 
     const sendFrame = async () => {
       if (videoRef.current && wsStatus === 'connected') {
@@ -250,13 +260,23 @@ const WarpPage = () => {
           0.8,
         );
       }
-      animationFrameId = requestAnimationFrame(sendFrame);
     };
 
-    sendFrame();
+    // Set up interval for frame sending
+    frameInterval = setInterval(sendFrame, FRAME_INTERVAL);
+
+    // Handle pings from server
+    const handlePing = () => {
+      if (socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send('pong');
+      }
+    };
+
+    socketRef.current.addEventListener('ping', handlePing);
 
     return () => {
-      cancelAnimationFrame(animationFrameId);
+      clearInterval(frameInterval);
+      socketRef.current?.removeEventListener('ping', handlePing);
     };
   }, [currentStream, wsStatus]);
 
