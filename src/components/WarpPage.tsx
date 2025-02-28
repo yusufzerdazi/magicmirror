@@ -12,6 +12,14 @@ const BACKOFF_FACTOR = 1.5;
 const FRAME_INTERVAL = 250; // Send 4 frames per second
 const MAX_BUFFER_SIZE = 16; // Don't let buffer grow too large
 const DISPLAY_DURATION = 0; // Time to show each frame before transition
+const AUDIO_INTERVAL = 5000; // Process audio every 5 seconds
+const MAX_TRANSCRIPT_LENGTH = 200; // Maximum characters to show
+const SCROLL_DURATION = 20; // Seconds to keep text visible
+
+type TranscriptEntry = {
+  text: string;
+  timestamp: number;
+};
 
 const buildWebsocketUrlFromPodId = (podId: string) => {
   return `ws://192.168.1.113:8765`;
@@ -37,6 +45,18 @@ const WarpPage = () => {
   const lastTransitionTime = useRef(Date.now());
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
+  const [transcription, setTranscription] = useState<string>('');
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([]);
+
+  const addTranscript = (text: string) => {
+    setTranscripts(prev => {
+      const now = Date.now();
+      const newTranscripts = [...prev, { text, timestamp: now }];
+      return newTranscripts.filter(t => now - t.timestamp < SCROLL_DURATION * 1000);
+    });
+  };
 
   // Send initial prompt when warp is ready
   useEffect(() => {
@@ -315,13 +335,109 @@ const WarpPage = () => {
     };
   }, [currentStream, wsStatus]);
 
+  // Handle audio recording and processing
+  useEffect(() => {
+    if (!warp?.podId || warp.podStatus !== 'RUNNING') return;
+
+    const initAudio = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          }
+        });
+        
+        const mediaRecorder = new MediaRecorder(stream, {
+          mimeType: 'audio/webm;codecs=opus'
+        });
+        mediaRecorderRef.current = mediaRecorder;
+
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            audioChunksRef.current.push(event.data);
+          }
+        };
+
+        mediaRecorder.onstop = async () => {
+          if (audioChunksRef.current.length === 0) return;
+
+          const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+          audioChunksRef.current = [];
+
+          const formData = new FormData();
+          formData.append('audio', audioBlob);
+
+          try {
+            const response = await fetch(`http://192.168.1.113:5556/transcribe`, {
+              method: 'POST',
+              body: formData,
+            });
+
+            if (response.ok) {
+              const data = await response.json();
+              if (data.text && data.text.trim()) {
+                const text = data.text.trim();
+                console.log('🎤 Received transcription:', text);
+                setTranscription(text);
+                addTranscript(text);
+              }
+            } else {
+              console.error('❌ Transcription failed:', await response.text());
+            }
+          } catch (error) {
+            console.error('❌ Error processing audio:', error);
+          }
+        };
+
+        // Improved recording cycle
+        const startRecording = () => {
+          if (mediaRecorder.state === 'inactive') {
+            audioChunksRef.current = [];
+            mediaRecorder.start();
+          }
+        };
+
+        const stopRecording = () => {
+          if (mediaRecorder.state === 'recording') {
+            mediaRecorder.stop();
+          }
+        };
+
+        const recordingInterval = setInterval(() => {
+          stopRecording();
+          startRecording();
+        }, AUDIO_INTERVAL);
+
+        startRecording();
+
+        return () => {
+          clearInterval(recordingInterval);
+          stopRecording();
+          stream.getTracks().forEach(track => track.stop());
+        };
+      } catch (error) {
+        console.error('Error initializing audio:', error);
+      }
+    };
+
+    initAudio();
+  }, [warp?.podId, warp?.podStatus]);
+
+  useEffect(() => {
+    const cleanup = setInterval(() => {
+      setTranscripts(prev => {
+        const now = Date.now();
+        return prev.filter(t => now - t.timestamp < SCROLL_DURATION * 1000);
+      });
+    }, 1000);
+
+    return () => clearInterval(cleanup);
+  }, []);
+
   return (
     <div className="fixed inset-0 bg-black">
-      {wsStatus !== 'connected' && (
-        <div className="absolute top-4 right-4 z-10 px-4 py-2 rounded-full bg-black/50 text-white">
-          {wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...'}
-        </div>
-      )}
       <video
         ref={videoRef}
         autoPlay
@@ -350,6 +466,34 @@ const WarpPage = () => {
         className="absolute inset-0 w-full h-full object-cover"
         style={{ zIndex: 2 }}
       />
+
+      <div className="absolute inset-x-0 bottom-0 overflow-hidden pointer-events-none" style={{ zIndex: 3 }}>
+        <div className="flex flex-col items-start p-4 gap-2">
+          {transcripts.map((transcript, index) => {
+            const age = (Date.now() - transcript.timestamp) / 1000;
+            const progress = age / SCROLL_DURATION;
+            return (
+              <div
+                key={transcript.timestamp}
+                className="text-white text-lg font-medium bg-black/50 px-4 py-2 rounded-full whitespace-nowrap"
+                style={{
+                  transform: `translateX(${100 * (1 - progress)}%)`,
+                  opacity: Math.max(0, 1 - progress),
+                  transition: 'all 1s linear',
+                }}
+              >
+                {transcript.text}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {wsStatus !== 'connected' && (
+        <div className="absolute top-4 right-4 z-10 px-4 py-2 rounded-full bg-black/50 text-white">
+          {wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...'}
+        </div>
+      )}
     </div>
   );
 };
