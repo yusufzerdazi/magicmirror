@@ -14,12 +14,23 @@ const MAX_BUFFER_SIZE = 16; // Don't let buffer grow too large
 const DISPLAY_DURATION = 0; // Time to show each frame before transition
 const AUDIO_INTERVAL = 5000; // Process audio every 5 seconds
 const MAX_TRANSCRIPT_LENGTH = 200; // Maximum characters to show
-const SCROLL_DURATION = 20; // Seconds to keep text visible
+const SCROLL_DURATION = 5; // Seconds to keep text visible
+const COIN_SIZE = 100; // Size in pixels
+const ROTATION_DURATION = 3; // Seconds for one full rotation
+const LEFT_PATH = "M -400 350 C -350 370 -300 330 -250 350 C -200 370 -150 330 -100 350 C -50 370 -25 330 0 350";  // Left wobbly curve
+const RIGHT_PATH = "M 400 350 C 350 370 300 330 250 350 C 200 370 150 330 100 350 C 50 370 25 330 0 350";  // Right wobbly curve (not reversed)
 
 type TranscriptEntry = {
   text: string;
   timestamp: number;
 };
+
+type DeviceInfo = {
+  deviceId: string;
+  label: string;
+};
+
+type Rotation = 0 | 90 | 180 | 270;
 
 const buildWebsocketUrlFromPodId = (podId: string) => {
   return `ws://192.168.1.113:8765`;
@@ -49,6 +60,9 @@ const WarpPage = () => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([]);
+  const [videoDevices, setVideoDevices] = useState<DeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
+  const [rotation, setRotation] = useState<Rotation>(0);
 
   const addTranscript = (text: string) => {
     setTranscripts(prev => {
@@ -58,27 +72,44 @@ const WarpPage = () => {
     });
   };
 
-  // Send initial prompt when warp is ready
-  useEffect(() => {
-    if (warp?.podId && warp.podStatus === 'RUNNING') {
-      const promptEndpointUrl = buildPromptEndpointUrlFromPodId(warp.podId);
-      const encodedPrompt = encodeURIComponent(INITIAL_PROMPT);
-      const endpoint = `${promptEndpointUrl}${encodedPrompt}`;
-
-      fetch(endpoint, {
-        method: 'POST',
-      }).catch(error => {
-        console.error('Error sending initial prompt:', error);
-      });
+  const getVideoDevices = async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices
+        .filter(device => device.kind === 'videoinput')
+        .map(device => ({
+          deviceId: device.deviceId,
+          label: device.label || `Camera ${device.deviceId}`
+        }));
+      setVideoDevices(videoDevices);
+      
+      if (videoDevices.length > 0 && !selectedDeviceId) {
+        setSelectedDeviceId(videoDevices[0].deviceId);
+      }
+    } catch (error) {
+      console.error('Error getting video devices:', error);
     }
-  }, [warp?.podId, warp?.podStatus]);
+  };
 
-  // Initialize webcam
+  useEffect(() => {
+    getVideoDevices();
+    
+    navigator.mediaDevices.addEventListener('devicechange', getVideoDevices);
+    return () => {
+      navigator.mediaDevices.removeEventListener('devicechange', getVideoDevices);
+    };
+  }, []);
+
   useEffect(() => {
     const initializeWebcam = async () => {
+      if (!selectedDeviceId) return;
+      
       try {
+        currentStream?.getTracks().forEach(track => track.stop());
+        
         const stream = await navigator.mediaDevices.getUserMedia({ 
           video: {
+            deviceId: { exact: selectedDeviceId },
             width: { ideal: FRAME_WIDTH },
             height: { ideal: FRAME_HEIGHT }
           }
@@ -97,7 +128,22 @@ const WarpPage = () => {
     return () => {
       currentStream?.getTracks().forEach(track => track.stop());
     };
-  }, []);
+  }, [selectedDeviceId]);
+
+  // Send initial prompt when warp is ready
+  useEffect(() => {
+    if (warp?.podId && warp.podStatus === 'RUNNING') {
+      const promptEndpointUrl = buildPromptEndpointUrlFromPodId(warp.podId);
+      const encodedPrompt = encodeURIComponent(INITIAL_PROMPT);
+      const endpoint = `${promptEndpointUrl}${encodedPrompt}`;
+
+      fetch(endpoint, {
+        method: 'POST',
+      }).catch(error => {
+        console.error('Error sending initial prompt:', error);
+      });
+    }
+  }, [warp?.podId, warp?.podStatus]);
 
   // Initialize warp
   useEffect(() => {
@@ -431,13 +477,109 @@ const WarpPage = () => {
         const now = Date.now();
         return prev.filter(t => now - t.timestamp < SCROLL_DURATION * 1000);
       });
-    }, 1000);
+    }, 16); // Run at ~60fps
 
     return () => clearInterval(cleanup);
   }, []);
 
+  useEffect(() => {
+    let animationFrame: number;
+    
+    const updateTranscripts = () => {
+      setTranscripts(prev => {
+        const now = Date.now();
+        return prev.filter(t => now - t.timestamp < SCROLL_DURATION * 1000);
+      });
+      animationFrame = requestAnimationFrame(updateTranscripts);
+    };
+
+    animationFrame = requestAnimationFrame(updateTranscripts);
+    
+    return () => {
+      cancelAnimationFrame(animationFrame);
+    };
+  }, []);
+
+  const applyRotationStyle = (rotation: number) => {
+    let transform = `rotate(${rotation}deg)`;
+    let scale = rotation === 90 || rotation === 270 ? 'scale(calc(9/16))' : 'scale(1)';
+    return `${transform} ${scale}`;
+  };
+
+  // Add this effect near the top of the component to inject the keyframes
+  useEffect(() => {
+    const styleSheet = document.createElement("style");
+    styleSheet.textContent = `
+      @keyframes coin-rotate {
+        0% {
+          transform: rotateY(0deg) rotateX(20deg);
+        }
+        100% {
+          transform: rotateY(360deg) rotateX(20deg);
+        }
+      }
+    `;
+    document.head.appendChild(styleSheet);
+    return () => {
+      document.head.removeChild(styleSheet);
+    };
+  }, []);
+
+  const SvgPaths = () => (
+    <svg 
+      className="fixed inset-0 w-screen h-screen pointer-events-none" 
+      style={{ zIndex: 3 }}
+      viewBox="-500 0 1000 400"
+      preserveAspectRatio="xMidYMax meet"
+    >
+      <defs>
+        <path id="leftPath" d={LEFT_PATH} />
+        <path id="rightPath" d={RIGHT_PATH} />
+      </defs>
+      <path 
+        d={LEFT_PATH} 
+        stroke="white" 
+        strokeWidth="1"
+        strokeOpacity="0.3"
+        fill="none" 
+      />
+      <path 
+        d={RIGHT_PATH} 
+        stroke="white" 
+        strokeWidth="1"
+        strokeOpacity="0.3"
+        fill="none" 
+      />
+    </svg>
+  );
+
   return (
     <div className="fixed inset-0 bg-black">
+      <div className="absolute top-4 left-4 z-10 flex gap-2">
+        {videoDevices.length > 1 && (
+          <select
+            className="bg-black/50 text-white px-4 py-2 rounded-full"
+            value={selectedDeviceId}
+            onChange={(e) => setSelectedDeviceId(e.target.value)}
+          >
+            {videoDevices.map(device => (
+              <option key={device.deviceId} value={device.deviceId}>
+                {device.label}
+              </option>
+            ))}
+          </select>
+        )}
+        <select
+          className="bg-black/50 text-white px-4 py-2 rounded-full"
+          value={rotation}
+          onChange={(e) => setRotation(Number(e.target.value) as Rotation)}
+        >
+          <option value={0}>0°</option>
+          <option value={90}>90°</option>
+          <option value={180}>180°</option>
+          <option value={270}>270°</option>
+        </select>
+      </div>
       <video
         ref={videoRef}
         autoPlay
@@ -445,6 +587,7 @@ const WarpPage = () => {
         className={`absolute inset-0 w-full h-full object-cover ${
           frameQueueRef.current.length > 0 ? 'hidden' : ''
         }`}
+        style={{ transform: applyRotationStyle(rotation) }}
       />
       <canvas
         ref={croppedCanvasRef}
@@ -457,35 +600,96 @@ const WarpPage = () => {
         width={FRAME_WIDTH}
         height={FRAME_HEIGHT}
         className="absolute inset-0 w-full h-full object-cover"
-        style={{ zIndex: 1 }}
+        style={{ 
+          zIndex: 1,
+          transform: applyRotationStyle(rotation)
+        }}
       />
       <canvas
         ref={currentCanvasRef}
         width={FRAME_WIDTH}
         height={FRAME_HEIGHT}
         className="absolute inset-0 w-full h-full object-cover"
-        style={{ zIndex: 2 }}
+        style={{ 
+          zIndex: 2,
+          transform: applyRotationStyle(rotation)
+        }}
       />
 
-      <div className="absolute inset-x-0 bottom-0 overflow-hidden pointer-events-none" style={{ zIndex: 3 }}>
-        <div className="flex flex-col items-start p-4 gap-2">
+      <SvgPaths />
+
+      <div className="fixed inset-0 overflow-visible pointer-events-none" style={{ zIndex: 3 }}>
+        <svg 
+          className="w-screen h-screen"
+          viewBox="-500 0 1000 400"
+          preserveAspectRatio="xMidYMax meet"
+        >
           {transcripts.map((transcript, index) => {
             const age = (Date.now() - transcript.timestamp) / 1000;
             const progress = age / SCROLL_DURATION;
+            const isLeft = index % 2 === 0;
+            
             return (
-              <div
+              <text
                 key={transcript.timestamp}
-                className="text-white text-lg font-medium bg-black/50 px-4 py-2 rounded-full whitespace-nowrap"
+                className="text-2xl font-medium fill-white drop-shadow-lg"
                 style={{
-                  transform: `translateX(${100 * (1 - progress)}%)`,
-                  opacity: Math.max(0, 1 - progress),
-                  transition: 'all 1s linear',
+                  opacity: Math.max(0, 1 - progress * 1.5),
+                  transition: 'opacity 16ms linear',
                 }}
               >
-                {transcript.text}
-              </div>
+                <textPath
+                  href={isLeft ? "#leftPath" : "#rightPath"}
+                  startOffset={`${progress * 100}%`}
+                  textAnchor="middle"
+                  className="fill-white"
+                >
+                  {transcript.text}
+                </textPath>
+              </text>
             );
           })}
+        </svg>
+      </div>
+
+      <div 
+        className="absolute left-1/2 bottom-16 -translate-x-1/2 z-20"
+        style={{
+          width: COIN_SIZE,
+          height: COIN_SIZE,
+          perspective: '1000px',
+          transformStyle: 'preserve-3d',
+        }}
+      >
+        <div
+          style={{
+            width: '100%',
+            height: '100%',
+            position: 'relative',
+            transformStyle: 'preserve-3d',
+            animation: `coin-rotate ${ROTATION_DURATION}s linear infinite`,
+          }}
+        >
+          <img
+            src="./mischief.jpg"
+            alt="Mischief"
+            className="absolute w-full h-full rounded-full object-cover"
+            style={{
+              backfaceVisibility: 'hidden',
+              transform: 'rotateY(0deg)',
+              filter: 'brightness(1.2)',
+            }}
+          />
+          <img
+            src="./mischief.jpg"
+            alt="Mischief"
+            className="absolute w-full h-full rounded-full object-cover"
+            style={{
+              backfaceVisibility: 'hidden',
+              transform: 'rotateY(180deg)',
+              filter: 'brightness(0.8)',
+            }}
+          />
         </div>
       </div>
 
