@@ -46,12 +46,11 @@ const PasswordOverlay: React.FC<{ onAuthenticated: (password: string) => void }>
   );
 };
 
-// Update PageContainer to support split layout
 const PageContainer: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   return (
     <div className="fixed inset-0 bg-black flex items-center justify-center">
       <div 
-        className="relative bg-black h-screen flex flex-col"
+        className="relative bg-black h-screen"
         style={{
           width: 'calc(9/16 * 100vh)', // Force 9:16 ratio based on height
           maxWidth: '100vw',           // Don't overflow viewport width
@@ -647,48 +646,44 @@ const WarpPage = () => {
   // Modify the return statement to show both video and auth overlay
   return (
     <PageContainer>
+      {/* Move video inside container */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        className="absolute inset-0 w-full h-full object-cover"
+        style={{ 
+          transform: applyRotationStyle(rotation),
+          visibility: frameQueueRef.current.length > 0 ? 'hidden' : 'visible',
+          zIndex: 1
+        }}
+      />
+
+      {/* Move canvases inside container */}
+      <canvas
+        ref={croppedCanvasRef}
+        width={FRAME_WIDTH}
+        height={FRAME_HEIGHT}
+        className="hidden"
+      />
+      <canvas
+        ref={nextCanvasRef}
+        className="absolute inset-0 w-full h-full"
+        style={secondCanvasStyle}
+      />
+      <canvas
+        ref={currentCanvasRef}
+        className="absolute inset-0 w-full h-full"
+        style={firstCanvasStyle}
+      />
+
+      {/* Show auth overlay if not authenticated */}
       {!isAuthenticated ? (
         <PasswordOverlay onAuthenticated={handleAuthenticated} />
       ) : (
         <>
-          {/* Split screen container */}
-          <div className="flex flex-col h-full">
-            {/* Top half - webcam input */}
-            <div className="relative h-1/2 border-b border-white/20">
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className="absolute inset-0 w-full h-full object-cover"
-                style={{ 
-                  transform: applyRotationStyle(rotation),
-                }}
-              />
-            </div>
-
-            {/* Bottom half - AI output */}
-            <div className="relative h-1/2">
-              <canvas
-                ref={croppedCanvasRef}
-                width={FRAME_WIDTH}
-                height={FRAME_HEIGHT}
-                className="hidden"
-              />
-              <canvas
-                ref={nextCanvasRef}
-                className="absolute inset-0 w-full h-full object-cover"
-                style={secondCanvasStyle}
-              />
-              <canvas
-                ref={currentCanvasRef}
-                className="absolute inset-0 w-full h-full object-cover"
-                style={firstCanvasStyle}
-              />
-            </div>
-          </div>
-
-          {/* Controls - adjusted position */}
+          {/* Rest of the authenticated UI */}
           <div className="absolute top-4 left-4 z-10 flex gap-2">
             {videoDevices.length > 1 && (
               <select
@@ -715,52 +710,49 @@ const WarpPage = () => {
             </select>
           </div>
 
-          {/* SVG paths and transcripts - adjusted to bottom half */}
-          <div className="absolute bottom-0 left-0 right-0 h-1/2" style={{ zIndex: 3 }}>
-            <SvgPaths />
-            <div className="absolute inset-0 overflow-hidden">
-              <svg 
-                className="w-full h-full"
-                viewBox="0 0 900 400"
-                preserveAspectRatio="xMidYMax meet"
-              >
-                {transcripts.map((transcript) => {
-                  const age = (Date.now() - transcript.timestamp) / 1000;
-                  const progress = age / SCROLL_DURATION;
-                  const isLeft = transcript.timestamp % 2 === 0;
-                  
-                  const startOffset = isLeft ? progress * 100 : (1 - progress) * 100;
-                  
-                  return (
-                    <text
-                      key={transcript.timestamp}
-                      className="text-3xl font-bold fill-white drop-shadow-lg"
-                      style={{
-                        fontFamily: '"Sigmar", serif',
-                      }}
-                      mask={isLeft ? "url(#leftMask)" : "url(#rightMask)"}
+          <SvgPaths />
+
+          <div className="absolute inset-0 overflow-hidden" style={{ zIndex: 3 }}>
+            <svg 
+              className="w-full h-full"
+              viewBox="0 0 900 400"
+              preserveAspectRatio="xMidYMax meet"
+            >
+              {transcripts.map((transcript) => {
+                const age = (Date.now() - transcript.timestamp) / 1000;
+                const progress = age / SCROLL_DURATION;
+                const isLeft = transcript.timestamp % 2 === 0;
+                
+                const startOffset = isLeft ? progress * 100 : (1 - progress) * 100;
+                
+                return (
+                  <text
+                    key={transcript.timestamp}
+                    className="text-3xl font-bold fill-white drop-shadow-lg"
+                    style={{
+                      fontFamily: '"Sigmar", serif',
+                    }}
+                    mask={isLeft ? "url(#leftMask)" : "url(#rightMask)"}
+                  >
+                    <textPath
+                      href={isLeft ? "#leftPath" : "#rightPath"}
+                      startOffset={`${startOffset}%`}
+                      textAnchor="middle"
                     >
-                      <textPath
-                        href={isLeft ? "#leftPath" : "#rightPath"}
-                        startOffset={`${startOffset}%`}
-                        textAnchor="middle"
-                      >
-                        {transcript.text}
-                      </textPath>
-                    </text>
-                  );
-                })}
-              </svg>
-            </div>
+                      {transcript.text}
+                    </textPath>
+                  </text>
+                );
+              })}
+            </svg>
           </div>
 
-          {/* Rotating coin - adjusted position */}
           <div 
             className="absolute left-1/2 -translate-x-1/2 z-20"
             style={{
               width: `${calculateCanvasDimensions().width * COIN_RELATIVE_SIZE}px`,
               height: `${calculateCanvasDimensions().width * COIN_RELATIVE_SIZE}px`,
-              bottom: '2%',
+              bottom: '4%', // Move down by reducing the bottom percentage from 12% to 8%
               perspective: '1000px',
               transformStyle: 'preserve-3d',
             }}
@@ -797,7 +789,6 @@ const WarpPage = () => {
             </div>
           </div>
 
-          {/* Connection status */}
           {wsStatus !== 'connected' && (
             <div className="absolute top-4 right-4 z-10 px-4 py-2 rounded-full bg-black/50 text-white">
               {wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...'}
