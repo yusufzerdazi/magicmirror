@@ -600,23 +600,28 @@ const WarpPage = () => {
         preserveAspectRatio="xMidYMax meet"
       >
         <defs>
+          {/* Define gradients */}
+          <linearGradient id="leftFade" x1="0%" y1="0%" x2="40%" y2="0%">
+            <stop offset="0%" stopColor="white" stopOpacity="1" />
+            <stop offset="100%" stopColor="white" stopOpacity="0" />
+          </linearGradient>
+          <linearGradient id="rightFade" x1="100%" y1="0%" x2="60%" y2="0%">
+            <stop offset="0%" stopColor="white" stopOpacity="1" />
+            <stop offset="100%" stopColor="white" stopOpacity="0" />
+          </linearGradient>
+
+          {/* Define masks */}
+          <mask id="leftMask">
+            <rect x="0" y="0" width="900" height="400" fill="url(#leftFade)" />
+          </mask>
+          <mask id="rightMask">
+            <rect x="0" y="0" width="900" height="400" fill="url(#rightFade)" />
+          </mask>
+
+          {/* Define paths */}
           <path id="leftPath" d={LEFT_PATH} />
           <path id="rightPath" d={RIGHT_PATH} />
         </defs>
-        <path 
-          d={LEFT_PATH} 
-          stroke="white" 
-          strokeWidth="1"
-          strokeOpacity="0"
-          fill="none" 
-        />
-        <path 
-          d={RIGHT_PATH} 
-          stroke="white" 
-          strokeWidth="1"
-          strokeOpacity="0"
-          fill="none" 
-        />
       </svg>
     </div>
   );
@@ -759,21 +764,21 @@ const WarpPage = () => {
                 const progress = age / SCROLL_DURATION;
                 const isLeft = transcript.timestamp % 2 === 0;
                 
+                const startOffset = isLeft ? progress * 100 : (1 - progress) * 100;
+                
                 return (
                   <text
                     key={transcript.timestamp}
                     className="text-3xl font-bold fill-white drop-shadow-lg"
                     style={{
-                      opacity: Math.max(0, 1 - progress * 1.5),
-                      transition: 'opacity 16ms linear',
-                      fontFamily: '"Sigmar", serif'
+                      fontFamily: '"Sigmar", serif',
                     }}
+                    mask={isLeft ? "url(#leftMask)" : "url(#rightMask)"}
                   >
                     <textPath
                       href={isLeft ? "#leftPath" : "#rightPath"}
-                      startOffset={isLeft ? `${progress * 100}%` : `${(1 - progress) * 100}%`}
+                      startOffset={`${startOffset}%`}
                       textAnchor="middle"
-                      className="fill-white"
                     >
                       {transcript.text}
                     </textPath>
