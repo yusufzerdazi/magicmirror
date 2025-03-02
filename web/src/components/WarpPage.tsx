@@ -1,20 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { createFullEndpoint } from '#root/utils/apiUtils.ts';
-import useConditionalAuth from '#root/src/hooks/useConditionalAuth';
-import { IS_WARP_LOCAL } from '#root/utils/constants.ts';
 import PasswordAuth from './PasswordAuth';
 
 const FRAME_WIDTH = 512;
 const FRAME_HEIGHT = 512;
 const INITIAL_PROMPT = "a mischievous cat with a third eye, matte pastel colour pallete in a cartoon style";
-const INITIAL_RETRY_DELAY = 1000;
-const MAX_RETRY_DELAY = 30000;
-const BACKOFF_FACTOR = 1.5;
 const FRAME_INTERVAL = 250; // Send 4 frames per second
 const MAX_BUFFER_SIZE = 16; // Don't let buffer grow too large
 const DISPLAY_DURATION = 0; // Time to show each frame before transition
 const AUDIO_INTERVAL = 5000; // Process audio every 5 seconds
-const MAX_TRANSCRIPT_LENGTH = 200; // Maximum characters to show
 const SCROLL_DURATION = 5; // Seconds to keep text visible
 const COIN_RELATIVE_SIZE = 0.10; // 10% of container width
 const ROTATION_DURATION = 3; // Seconds for one full rotation
@@ -70,7 +63,6 @@ const PageContainer: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 };
 
 const WarpPage = () => {
-  const { getToken } = useConditionalAuth();
   const [currentStream, setCurrentStream] = useState<MediaStream | null>(null);
   const [warp, setWarp] = useState<any>(null);
   const [isRendering, setIsRendering] = useState(false);
@@ -85,7 +77,6 @@ const WarpPage = () => {
   const lastTransitionTime = useRef(Date.now());
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
-  const [transcription, setTranscription] = useState<string>('');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const [transcripts, setTranscripts] = useState<TranscriptEntry[]>([]);
@@ -183,37 +174,6 @@ const WarpPage = () => {
       console.error('Error sending initial prompt:', error);
     });
   }, [warp?.podId, warp?.podStatus, isAuthenticated, serverPassword]);
-
-  // Initialize warp
-  useEffect(() => {
-    const initializeWarp = async () => {
-      if (!getToken) return;
-      
-      const token = await getToken();
-      const response = await fetch(createFullEndpoint(`warps`), {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-      });
-
-      if (response.ok) {
-        const { entities } = await response.json();
-        const warp = entities?.warps?.[0];
-        if (warp?.podId) {
-          setWarp(warp);
-        }
-      }
-    };
-
-    if (!IS_WARP_LOCAL) {
-      initializeWarp();
-    } else {
-      setWarp({ id: 'local', podId: 'local', podStatus: 'RUNNING' });
-    }
-  }, [getToken]);
 
   // Frame display logic
   useEffect(() => {
