@@ -394,9 +394,41 @@ const WarpPage = () => {
             autoGainControl: true,
           }
         });
-        
+
+        // Add this before the MediaRecorder initialization to debug supported formats
+        const debugSupportedMimeTypes = () => {
+          const types = [
+            'audio/webm',
+            'audio/webm;codecs=opus',
+            'audio/ogg;codecs=opus',
+            'audio/mp4',
+            'audio/mpeg',
+            'audio/wav'
+          ];
+          
+          console.log('Supported audio MIME types:');
+          types.forEach(type => {
+            console.log(`${type}: ${MediaRecorder.isTypeSupported(type)}`);
+          });
+        };
+
+        // Call this function before creating the MediaRecorder
+        debugSupportedMimeTypes();
+
+        let selectedMimeType = '';
+        for (const mimeType of ['audio/webm', 'audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4']) {
+          if (MediaRecorder.isTypeSupported(mimeType)) {
+            selectedMimeType = mimeType;
+            break;
+          }
+        }
+
+        if (!selectedMimeType) {
+          throw new Error('No supported MIME type found for MediaRecorder');
+        }
+
         const mediaRecorder = new MediaRecorder(stream, {
-          mimeType: 'audio/webm;codecs=opus'
+          mimeType: selectedMimeType
         });
         mediaRecorderRef.current = mediaRecorder;
 
@@ -437,6 +469,14 @@ const WarpPage = () => {
           }
         };
 
+        mediaRecorder.onerror = (event) => {
+          console.error('MediaRecorder error:', event);
+          // Optionally attempt to restart recording
+          if (mediaRecorder.state !== 'inactive') {
+            mediaRecorder.stop();
+          }
+        };
+
         // Improved recording cycle
         const startRecording = () => {
           if (mediaRecorder.state === 'inactive') {
@@ -465,6 +505,12 @@ const WarpPage = () => {
         };
       } catch (error) {
         console.error('Error initializing audio:', error);
+        // Optionally show user-friendly error message
+        if (error instanceof DOMException && error.name === 'NotAllowedError') {
+          console.log('Microphone access was denied by the user');
+        } else if (error instanceof DOMException && error.name === 'NotFoundError') {
+          console.log('No microphone was found');
+        }
       }
     };
 
@@ -636,7 +682,7 @@ const WarpPage = () => {
             return (
               <text
                 key={transcript.timestamp}
-                className="text-5xl font-bold  fill-white drop-shadow-lg"
+                className="text-4xl font-bold  fill-white drop-shadow-lg"
                 style={{
                   opacity: Math.max(0, 1 - progress * 1.5),
                   transition: 'opacity 16ms linear',
