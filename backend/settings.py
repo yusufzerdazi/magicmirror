@@ -1,10 +1,15 @@
 from pydantic.v1 import BaseSettings, Field
+from config import load_server_config
+import os
 
 
 class Settings(BaseSettings):
     # config, cannot be changed
     mode: str = Field(default="video")
     worker_id: int = Field(default=0)
+
+    # Add server_password field
+    server_password: str = Field(default="")
 
     output_fast: bool = Field(default=True)
     zmq_video_port: int = Field(default=5554)
@@ -40,6 +45,18 @@ class Settings(BaseSettings):
     fps: int = Field(default=30)
     directory: str = Field(default="data/frames")
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        try:
+            # Load server config
+            server_config = load_server_config()
+            self.server_password = server_config.SERVER_PASSWORD
+            print(f"Successfully loaded server password")  # Debug line
+        except Exception as e:
+            print(f"Error loading server password: {e}")
+            raise
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        case_sensitive = True

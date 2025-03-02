@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createFullEndpoint } from '#root/utils/apiUtils.ts';
 import useConditionalAuth from '#root/src/hooks/useConditionalAuth';
 import { IS_WARP_LOCAL } from '#root/utils/constants.ts';
+import PasswordAuth from './PasswordAuth';
 
 const FRAME_WIDTH = 512;
 const FRAME_HEIGHT = 512;
@@ -15,10 +16,10 @@ const DISPLAY_DURATION = 0; // Time to show each frame before transition
 const AUDIO_INTERVAL = 5000; // Process audio every 5 seconds
 const MAX_TRANSCRIPT_LENGTH = 200; // Maximum characters to show
 const SCROLL_DURATION = 5; // Seconds to keep text visible
-const COIN_SIZE = 100; // Size in pixels
+const COIN_RELATIVE_SIZE = 0.10; // 10% of container width
 const ROTATION_DURATION = 3; // Seconds for one full rotation
-const LEFT_PATH = "M -600 300 C -500 350 -400 250 -300 300 C -250 350 -200 250 -150 300 C -100 350 -50 250 0 350";  // Left wobbly curve
-const RIGHT_PATH = "M 0 350 C 50 250 100 350 150 300 C 200 350 250 250 300 300 C 350 350 400 250 600 300";  // Right wobbly curve starting from center
+const LEFT_PATH = "M 0 300 C 100 350 200 250 300 300 C 350 350 400 250 450 300";  // Left wobbly curve
+const RIGHT_PATH = "M 450 300 C 500 250 550 350 600 300 C 650 350 700 250 900 300";  // Right wobbly curve
 
 type TranscriptEntry = {
   text: string;
@@ -38,6 +39,34 @@ const buildWebsocketUrlFromPodId = (podId: string) => {
 
 const buildPromptEndpointUrlFromPodId = (podId: string) => {
   return `http://192.168.1.113:5556/prompt/`;
+};
+
+// First, move the PasswordAuth component to be an overlay
+const PasswordOverlay: React.FC<{ onAuthenticated: (password: string) => void }> = ({ onAuthenticated }) => {
+  return (
+    <div className="fixed inset-0 flex items-center justify-center" style={{ zIndex: 100 }}>
+      <div className="absolute inset-0 bg-black/50" />
+      <div className="relative z-10">
+        <PasswordAuth onAuthenticated={onAuthenticated} />
+      </div>
+    </div>
+  );
+};
+
+const PageContainer: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  return (
+    <div className="fixed inset-0 bg-black flex items-center justify-center">
+      <div 
+        className="relative bg-black h-screen"
+        style={{
+          width: 'calc(9/16 * 100vh)', // Force 9:16 ratio based on height
+          maxWidth: '100vw',           // Don't overflow viewport width
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
 };
 
 const WarpPage = () => {
@@ -64,6 +93,10 @@ const WarpPage = () => {
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [rotation, setRotation] = useState<Rotation>(0);
   const [totalTranscripts, setTotalTranscripts] = useState<number>(0);
+  const [isFirstCanvasCurrent, setIsFirstCanvasCurrent] = useState(true);
+  const [serverPassword, setServerPassword] = useState<string | null>(null);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authToken, setAuthToken] = useState<string | null>(null);
 
   const addTranscript = (text: string) => {
     setTotalTranscripts(prev => prev + 1);
@@ -93,6 +126,7 @@ const WarpPage = () => {
     }
   };
 
+  // Move video initialization logic outside of authentication check
   useEffect(() => {
     getVideoDevices();
     
@@ -111,7 +145,7 @@ const WarpPage = () => {
         
         const stream = await navigator.mediaDevices.getUserMedia({ 
           video: {
-            deviceId: { exact: selectedDeviceId },
+            deviceId: { exact: selectedDeviceId }
           }
         });
         setCurrentStream(stream);
@@ -130,20 +164,25 @@ const WarpPage = () => {
     };
   }, [selectedDeviceId]);
 
-  // Send initial prompt when warp is ready
+  // Send initial prompt when warp is ready and authenticated
   useEffect(() => {
-    if (warp?.podId && warp.podStatus === 'RUNNING') {
-      const promptEndpointUrl = buildPromptEndpointUrlFromPodId(warp.podId);
-      const encodedPrompt = encodeURIComponent(INITIAL_PROMPT);
-      const endpoint = `${promptEndpointUrl}${encodedPrompt}`;
-
-      fetch(endpoint, {
-        method: 'POST',
-      }).catch(error => {
-        console.error('Error sending initial prompt:', error);
-      });
+    if (!isAuthenticated || !warp?.podId || warp.podStatus !== 'RUNNING') {
+      return;
     }
-  }, [warp?.podId, warp?.podStatus]);
+
+    const promptEndpointUrl = buildPromptEndpointUrlFromPodId(warp.podId);
+    const encodedPrompt = encodeURIComponent(INITIAL_PROMPT);
+    const endpoint = `${promptEndpointUrl}${encodedPrompt}`;
+
+    fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${serverPassword}`
+      }
+    }).catch(error => {
+      console.error('Error sending initial prompt:', error);
+    });
+  }, [warp?.podId, warp?.podStatus, isAuthenticated, serverPassword]);
 
   // Initialize warp
   useEffect(() => {
@@ -184,7 +223,6 @@ const WarpPage = () => {
       const now = Date.now();
       const timeSinceLastTransition = now - lastTransitionTime.current;
 
-      // Check if it's time for next frame and we have frames to show
       if (!isTransitioningRef.current && 
           frameQueueRef.current.length > 0 && 
           timeSinceLastTransition >= DISPLAY_DURATION) {
@@ -203,9 +241,37 @@ const WarpPage = () => {
         const nextCtx = nextCanvas?.getContext('2d');
         
         if (nextFrame && nextCtx && nextCanvas) {
-          // Draw next frame on bottom canvas
-          nextCtx.clearRect(0, 0, FRAME_WIDTH, FRAME_HEIGHT);
-          nextCtx.drawImage(nextFrame, 0, 0, FRAME_WIDTH, FRAME_HEIGHT);
+          // Clear the canvas
+          nextCtx.clearRect(0, 0, nextCanvas.width, nextCanvas.height);
+          
+          // Calculate dimensions to cover the canvas while maintaining aspect ratio
+          const frameAspect = nextFrame.width / nextFrame.height;
+          const canvasAspect = nextCanvas.width / nextCanvas.height;
+          
+          let drawWidth = nextCanvas.width;
+          let drawHeight = nextCanvas.height;
+          let offsetX = 0;
+          let offsetY = 0;
+
+          if (canvasAspect > frameAspect) {
+            // Canvas is wider than frame - match width and overflow height
+            drawWidth = nextCanvas.width;
+            drawHeight = drawWidth / frameAspect;
+            offsetY = (nextCanvas.height - drawHeight) / 2;
+          } else {
+            // Canvas is taller than frame - match height and overflow width
+            drawHeight = nextCanvas.height;
+            drawWidth = drawHeight * frameAspect;
+            offsetX = (nextCanvas.width - drawWidth) / 2;
+          }
+
+          // Draw the frame with cover behavior
+          nextCtx.drawImage(
+            nextFrame,
+            offsetX, offsetY,
+            drawWidth,
+            drawHeight
+          );
           
           // Start transition
           isTransitioningRef.current = true;
@@ -248,79 +314,102 @@ const WarpPage = () => {
     };
 
     displayNextFrame();
-  }, [isRendering]);
+  }, [isRendering, isFirstCanvasCurrent]);
 
-  // WebSocket connection
-  useEffect(() => {
-    if (!warp?.podId || warp.podStatus !== 'RUNNING') return;
+  // Modify WebSocket connection logic
+  const connectWebSocket = useCallback(async () => {
+    if (!serverPassword) {
+      return;
+    }
 
-    let retryCount = 0;
-    let retryDelay = INITIAL_RETRY_DELAY;
+    const ws = new WebSocket(buildWebsocketUrlFromPodId(""));
+    
+    ws.onopen = () => {
+      console.log("WebSocket connected");
+      // Send authentication immediately after connection
+      ws.send(JSON.stringify({
+        type: "auth",
+        password: serverPassword
+      }));
+    };
 
-    const connectWebSocket = () => {
-      setWsStatus('connecting');
-      const websocketUrl = buildWebsocketUrlFromPodId(warp.podId);
-      const socket = new WebSocket(websocketUrl);
-      socket.binaryType = 'arraybuffer';
-
-      socket.onopen = () => {
-        setWsStatus('connected');
-        console.log('WebSocket connected');
-        retryCount = 0;
-        retryDelay = INITIAL_RETRY_DELAY;
-      };
-
-      socket.onmessage = event => {
-        const blob = new Blob([event.data], { type: 'image/jpeg' });
+    ws.onmessage = (event) => {
+      if (event.data instanceof Blob) {
+        // Handle binary frame data
+        const blob = event.data;
         const url = URL.createObjectURL(blob);
         const img = new Image();
         img.onload = () => {
           URL.revokeObjectURL(url);
-          // Only add to queue if we haven't exceeded MAX_BUFFER_SIZE
-          if (frameQueueRef.current.length < MAX_BUFFER_SIZE) {
-            frameQueueRef.current = [...frameQueueRef.current, img];
-          }
+          frameQueueRef.current.push(img);
         };
         img.src = url;
-      };
-
-      socket.onclose = () => {
-        setWsStatus('disconnected');
-        console.log(`WebSocket disconnected (attempt ${retryCount + 1})`);
-        
-        if (reconnectTimeoutRef.current) {
-          clearTimeout(reconnectTimeoutRef.current);
-        }
-
-        // Calculate next retry delay with exponential backoff
-        retryDelay = Math.min(retryDelay * BACKOFF_FACTOR, MAX_RETRY_DELAY);
-        retryCount++;
-        
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (socketRef.current?.readyState === WebSocket.CLOSED) {
-            connectWebSocket();
-          }
-        }, retryDelay);
-      };
-
-      socket.onerror = (error) => {
-        console.error('WebSocket error:', error);
-      };
-
-      socketRef.current = socket;
+      }
     };
 
-    connectWebSocket();
-
-    return () => {
+    ws.onclose = () => {
+      console.log("WebSocket closed");
+      setWsStatus('disconnected');
+      // Try to reconnect
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }
+      reconnectTimeoutRef.current = setTimeout(connectWebSocket, 1000);
+    };
+
+    ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
+    };
+
+    socketRef.current = ws;
+    setWsStatus('connected');
+  }, [serverPassword]);
+
+  // Modify transcribe function
+  const transcribe = async (audioBlob: Blob) => {
+    if (!serverPassword) {
+      return;
+    }
+
+    const formData = new FormData();
+    formData.append('file', audioBlob);
+
+    try {
+      const response = await fetch(`http://192.168.1.113:5556/transcribe`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${serverPassword}`
+        },
+        body: formData
+      });
+
+      if (response.status === 401) {
+        setIsAuthenticated(false);
+        setServerPassword(null);
+        return;
+      }
+
+      const data = await response.json();
+      if (data.text) {
+        addTranscript(data.text);
+      }
+    } catch (error) {
+      console.error('Error:', error);
+    }
+  };
+
+  // Update useEffect to depend on serverPassword
+  useEffect(() => {
+    if (!currentStream || !serverPassword) return;
+    
+    connectWebSocket();
+    
+    return () => {
       if (socketRef.current) {
         socketRef.current.close();
       }
     };
-  }, [warp?.podId, warp?.podStatus]);
+  }, [currentStream, serverPassword, connectWebSocket]);
 
   // Send frames
   useEffect(() => {
@@ -381,9 +470,9 @@ const WarpPage = () => {
     };
   }, [currentStream, wsStatus]);
 
-  // Handle audio recording and processing
+  // Add back the audio recording and processing
   useEffect(() => {
-    if (!warp?.podId || warp.podStatus !== 'RUNNING') return;
+    if (!isAuthenticated) return; // Only start audio recording when authenticated
 
     const initAudio = async () => {
       try {
@@ -395,40 +484,8 @@ const WarpPage = () => {
           }
         });
 
-        // Add this before the MediaRecorder initialization to debug supported formats
-        const debugSupportedMimeTypes = () => {
-          const types = [
-            'audio/webm',
-            'audio/webm;codecs=opus',
-            'audio/ogg;codecs=opus',
-            'audio/mp4',
-            'audio/mpeg',
-            'audio/wav'
-          ];
-          
-          console.log('Supported audio MIME types:');
-          types.forEach(type => {
-            console.log(`${type}: ${MediaRecorder.isTypeSupported(type)}`);
-          });
-        };
-
-        // Call this function before creating the MediaRecorder
-        debugSupportedMimeTypes();
-
-        let selectedMimeType = '';
-        for (const mimeType of ['audio/webm', 'audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4']) {
-          if (MediaRecorder.isTypeSupported(mimeType)) {
-            selectedMimeType = mimeType;
-            break;
-          }
-        }
-
-        if (!selectedMimeType) {
-          throw new Error('No supported MIME type found for MediaRecorder');
-        }
-
         const mediaRecorder = new MediaRecorder(stream, {
-          mimeType: selectedMimeType
+          mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg'
         });
         mediaRecorderRef.current = mediaRecorder;
 
@@ -444,37 +501,7 @@ const WarpPage = () => {
           const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
           audioChunksRef.current = [];
 
-          const formData = new FormData();
-          formData.append('audio', audioBlob);
-
-          try {
-            const response = await fetch(`http://192.168.1.113:5556/transcribe`, {
-              method: 'POST',
-              body: formData,
-            });
-
-            if (response.ok) {
-              const data = await response.json();
-              if (data.text && data.text.trim()) {
-                const text = data.text.trim();
-                console.log('🎤 Received transcription:', text);
-                setTranscription(text);
-                addTranscript(text);
-              }
-            } else {
-              console.error('❌ Transcription failed:', await response.text());
-            }
-          } catch (error) {
-            console.error('❌ Error processing audio:', error);
-          }
-        };
-
-        mediaRecorder.onerror = (event) => {
-          console.error('MediaRecorder error:', event);
-          // Optionally attempt to restart recording
-          if (mediaRecorder.state !== 'inactive') {
-            mediaRecorder.stop();
-          }
+          await transcribe(audioBlob);
         };
 
         // Improved recording cycle
@@ -504,18 +531,12 @@ const WarpPage = () => {
           stream.getTracks().forEach(track => track.stop());
         };
       } catch (error) {
-        console.error('Error initializing audio:', error);
-        // Optionally show user-friendly error message
-        if (error instanceof DOMException && error.name === 'NotAllowedError') {
-          console.log('Microphone access was denied by the user');
-        } else if (error instanceof DOMException && error.name === 'NotFoundError') {
-          console.log('No microphone was found');
-        }
+        console.error('Error accessing microphone:', error);
       }
     };
 
     initAudio();
-  }, [warp?.podId, warp?.podStatus]);
+  }, [isAuthenticated]); // Only re-run when authentication status changes
 
   useEffect(() => {
     const cleanup = setInterval(() => {
@@ -572,71 +593,110 @@ const WarpPage = () => {
   }, []);
 
   const SvgPaths = () => (
-    <svg 
-      className="fixed inset-0 w-screen h-screen pointer-events-none" 
-      style={{ zIndex: 3 }}
-      viewBox="-600 0 1200 400"
-      preserveAspectRatio="xMidYMax meet"
-    >
-      <defs>
-        <path id="leftPath" d={LEFT_PATH} />
-        <path id="rightPath" d={RIGHT_PATH} />
-      </defs>
-      <path 
-        d={LEFT_PATH} 
-        stroke="white" 
-        strokeWidth="1"
-        strokeOpacity="0"
-        fill="none" 
-      />
-      <path 
-        d={RIGHT_PATH} 
-        stroke="white" 
-        strokeWidth="1"
-        strokeOpacity="0"
-        fill="none" 
-      />
-    </svg>
+    <div className="absolute inset-0" style={{ zIndex: 3 }}>
+      <svg 
+        className="w-full h-full pointer-events-none"
+        viewBox="0 0 900 400"
+        preserveAspectRatio="xMidYMax meet"
+      >
+        <defs>
+          <path id="leftPath" d={LEFT_PATH} />
+          <path id="rightPath" d={RIGHT_PATH} />
+        </defs>
+        <path 
+          d={LEFT_PATH} 
+          stroke="white" 
+          strokeWidth="1"
+          strokeOpacity="0"
+          fill="none" 
+        />
+        <path 
+          d={RIGHT_PATH} 
+          stroke="white" 
+          strokeWidth="1"
+          strokeOpacity="0"
+          fill="none" 
+        />
+      </svg>
+    </div>
   );
 
+  const firstCanvasStyle = {
+    zIndex: isFirstCanvasCurrent ? 2 : 1,
+    transform: applyRotationStyle(rotation),
+    opacity: 1  // Remove transition, just keep opacity at 1
+  };
+
+  const secondCanvasStyle = {
+    zIndex: isFirstCanvasCurrent ? 1 : 2,
+    transform: applyRotationStyle(rotation),
+    opacity: 1  // Remove transition, just keep opacity at 1
+  };
+
+  const handleAuthenticated = (password: string) => {
+    setIsAuthenticated(true);
+    setAuthToken(password);
+    setServerPassword(password);
+  };
+
+  // Update the calculateCanvasDimensions function
+  const calculateCanvasDimensions = () => {
+    const windowWidth = window.innerWidth;
+    const windowHeight = window.innerHeight;
+    const targetAspect = 9/16; // Force 9:16 aspect ratio
+
+    let width, height;
+    if (windowWidth / windowHeight > targetAspect) {
+      // Window is wider than 9:16
+      height = windowHeight;
+      width = height * targetAspect;
+    } else {
+      // Window is taller than 9:16
+      width = windowWidth;
+      height = width / targetAspect;
+    }
+
+    return { width, height };
+  };
+
+  // Update the resize handler
+  useEffect(() => {
+    const updateDimensions = () => {
+      const { width, height } = calculateCanvasDimensions();
+      if (currentCanvasRef.current) {
+        currentCanvasRef.current.width = width;
+        currentCanvasRef.current.height = height;
+      }
+      if (nextCanvasRef.current) {
+        nextCanvasRef.current.width = width;
+        nextCanvasRef.current.height = height;
+      }
+    };
+
+    window.addEventListener('resize', updateDimensions);
+    updateDimensions(); // Set initial dimensions
+
+    return () => window.removeEventListener('resize', updateDimensions);
+  }, []);
+
+  // Modify the return statement to show both video and auth overlay
   return (
-    <div className="fixed inset-0 bg-black">
-      <div className="absolute top-4 left-4 z-10 flex gap-2">
-        {videoDevices.length > 1 && (
-          <select
-            className="bg-black/50 text-white px-4 py-2 rounded-full"
-            value={selectedDeviceId}
-            onChange={(e) => setSelectedDeviceId(e.target.value)}
-          >
-            {videoDevices.map(device => (
-              <option key={device.deviceId} value={device.deviceId}>
-                {device.label}
-              </option>
-            ))}
-          </select>
-        )}
-        <select
-          className="bg-black/50 text-white px-4 py-2 rounded-full"
-          value={rotation}
-          onChange={(e) => setRotation(Number(e.target.value) as Rotation)}
-        >
-          <option value={0}>0°</option>
-          <option value={90}>90°</option>
-          <option value={180}>180°</option>
-          <option value={270}>270°</option>
-        </select>
-      </div>
+    <PageContainer>
+      {/* Move video inside container */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
-        className={`absolute inset-0 w-full h-full object-cover ${
-          frameQueueRef.current.length > 0 ? 'hidden' : ''
-        }`}
+        muted
+        className="absolute inset-0 w-full h-full object-cover"
         style={{ 
           transform: applyRotationStyle(rotation),
+          visibility: frameQueueRef.current.length > 0 ? 'hidden' : 'visible',
+          zIndex: 1
         }}
       />
+
+      {/* Move canvases inside container */}
       <canvas
         ref={croppedCanvasRef}
         width={FRAME_WIDTH}
@@ -645,111 +705,134 @@ const WarpPage = () => {
       />
       <canvas
         ref={nextCanvasRef}
-        width={FRAME_WIDTH}
-        height={FRAME_HEIGHT}
-        className="absolute inset-0 w-screen h-screen"
-        style={{ 
-          zIndex: 1,
-          transform: applyRotationStyle(rotation),
-          objectFit: 'cover'
-        }}
+        className="absolute inset-0 w-full h-full"
+        style={secondCanvasStyle}
       />
       <canvas
         ref={currentCanvasRef}
-        width={FRAME_WIDTH}
-        height={FRAME_HEIGHT}
-        className="absolute inset-0 w-screen h-screen"
-        style={{ 
-          zIndex: 2,
-          transform: applyRotationStyle(rotation),
-          objectFit: 'cover'
-        }}
+        className="absolute inset-0 w-full h-full"
+        style={firstCanvasStyle}
       />
 
-      <SvgPaths />
-
-      <div className="fixed inset-0 overflow-visible pointer-events-none" style={{ zIndex: 3 }}>
-        <svg 
-          className="w-screen h-screen"
-          viewBox="-600 0 1200 400"
-          preserveAspectRatio="xMidYMax meet"
-        >
-          {transcripts.map((transcript) => {
-            const age = (Date.now() - transcript.timestamp) / 1000;
-            const progress = age / SCROLL_DURATION;
-            const isLeft = transcript.timestamp % 2 === 0;
-            
-            return (
-              <text
-                key={transcript.timestamp}
-                className="text-4xl font-bold  fill-white drop-shadow-lg"
-                style={{
-                  opacity: Math.max(0, 1 - progress * 1.5),
-                  transition: 'opacity 16ms linear',
-                  fontFamily: '"Sigmar", serif'
-                }}
+      {/* Show auth overlay if not authenticated */}
+      {!isAuthenticated ? (
+        <PasswordOverlay onAuthenticated={handleAuthenticated} />
+      ) : (
+        <>
+          {/* Rest of the authenticated UI */}
+          <div className="absolute top-4 left-4 z-10 flex gap-2">
+            {videoDevices.length > 1 && (
+              <select
+                className="bg-black/50 text-white px-4 py-2 rounded-full"
+                value={selectedDeviceId}
+                onChange={(e) => setSelectedDeviceId(e.target.value)}
               >
-                <textPath
-                  href={isLeft ? "#leftPath" : "#rightPath"}
-                  startOffset={isLeft ? `${progress * 100}%` : `${(1 - progress) * 100}%`}
-                  textAnchor="middle"
-                  className="fill-white"
-                >
-                  {transcript.text}
-                </textPath>
-              </text>
-            );
-          })}
-        </svg>
-      </div>
+                {videoDevices.map(device => (
+                  <option key={device.deviceId} value={device.deviceId}>
+                    {device.label}
+                  </option>
+                ))}
+              </select>
+            )}
+            <select
+              className="bg-black/50 text-white px-4 py-2 rounded-full"
+              value={rotation}
+              onChange={(e) => setRotation(Number(e.target.value) as Rotation)}
+            >
+              <option value={0}>0°</option>
+              <option value={90}>90°</option>
+              <option value={180}>180°</option>
+              <option value={270}>270°</option>
+            </select>
+          </div>
 
-      <div 
-        className="absolute left-1/2 bottom-16 -translate-x-1/2 z-20"
-        style={{
-          width: COIN_SIZE,
-          height: COIN_SIZE,
-          perspective: '1000px',
-          transformStyle: 'preserve-3d',
-        }}
-      >
-        <div
-          style={{
-            width: '100%',
-            height: '100%',
-            position: 'relative',
-            transformStyle: 'preserve-3d',
-            animation: `coin-rotate ${ROTATION_DURATION}s linear infinite`,
-          }}
-        >
-          <img
-            src="./mischief.jpg"
-            alt="Mischief"
-            className="absolute w-full h-full rounded-full object-cover"
-            style={{
-              backfaceVisibility: 'hidden',
-              transform: 'rotateY(0deg)',
-              filter: 'brightness(1.2)',
-            }}
-          />
-          <img
-            src="./mischief.jpg"
-            alt="Mischief"
-            className="absolute w-full h-full rounded-full object-cover"
-            style={{
-              backfaceVisibility: 'hidden',
-              transform: 'rotateY(180deg)',
-              filter: 'brightness(0.8)',
-            }}
-          />
-        </div>
-      </div>
+          <SvgPaths />
 
-      {wsStatus !== 'connected' && (
-        <div className="absolute top-4 right-4 z-10 px-4 py-2 rounded-full bg-black/50 text-white">
-          {wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...'}
-        </div>
+          <div className="absolute inset-0 overflow-hidden" style={{ zIndex: 3 }}>
+            <svg 
+              className="w-full h-full"
+              viewBox="0 0 900 400"
+              preserveAspectRatio="xMidYMax meet"
+            >
+              {transcripts.map((transcript) => {
+                const age = (Date.now() - transcript.timestamp) / 1000;
+                const progress = age / SCROLL_DURATION;
+                const isLeft = transcript.timestamp % 2 === 0;
+                
+                return (
+                  <text
+                    key={transcript.timestamp}
+                    className="text-3xl font-bold fill-white drop-shadow-lg"
+                    style={{
+                      opacity: Math.max(0, 1 - progress * 1.5),
+                      transition: 'opacity 16ms linear',
+                      fontFamily: '"Sigmar", serif'
+                    }}
+                  >
+                    <textPath
+                      href={isLeft ? "#leftPath" : "#rightPath"}
+                      startOffset={isLeft ? `${progress * 100}%` : `${(1 - progress) * 100}%`}
+                      textAnchor="middle"
+                      className="fill-white"
+                    >
+                      {transcript.text}
+                    </textPath>
+                  </text>
+                );
+              })}
+            </svg>
+          </div>
+
+          <div 
+            className="absolute left-1/2 -translate-x-1/2 z-20"
+            style={{
+              width: `${calculateCanvasDimensions().width * COIN_RELATIVE_SIZE}px`,
+              height: `${calculateCanvasDimensions().width * COIN_RELATIVE_SIZE}px`,
+              bottom: '4%', // Move down by reducing the bottom percentage from 12% to 8%
+              perspective: '1000px',
+              transformStyle: 'preserve-3d',
+            }}
+          >
+            <div
+              style={{
+                width: '100%',
+                height: '100%',
+                position: 'relative',
+                transformStyle: 'preserve-3d',
+                animation: `coin-rotate ${ROTATION_DURATION}s linear infinite`,
+              }}
+            >
+              <img
+                src="./mischief.jpg"
+                alt="Mischief"
+                className="absolute w-full h-full rounded-full object-cover"
+                style={{
+                  backfaceVisibility: 'hidden',
+                  transform: 'rotateY(0deg)',
+                  filter: 'brightness(1.2)',
+                }}
+              />
+              <img
+                src="./mischief.jpg"
+                alt="Mischief"
+                className="absolute w-full h-full rounded-full object-cover"
+                style={{
+                  backfaceVisibility: 'hidden',
+                  transform: 'rotateY(180deg)',
+                  filter: 'brightness(0.8)',
+                }}
+              />
+            </div>
+          </div>
+
+          {wsStatus !== 'connected' && (
+            <div className="absolute top-4 right-4 z-10 px-4 py-2 rounded-full bg-black/50 text-white">
+              {wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...'}
+            </div>
+          )}
+        </>
       )}
-    </div>
+    </PageContainer>
   );
 };
 

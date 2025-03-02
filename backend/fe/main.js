@@ -17,6 +17,7 @@ const stateRofl = {
   isStreaming: false,
   isRendering: false,
   isRenderSmooth: false,
+  serverPassword: null,
 };
 
 const renderFlash = () => {
@@ -314,16 +315,35 @@ function stopCurrentStream() {
   }
 }
 
-function connectWebSocket() {
-  stateRofl.socket = new WebSocket(WEBSOCKET_URL);
+async function promptForPassword() {
+  const password = prompt("Please enter the server password:");
+  if (!password) {
+    alert("Password is required to use this application");
+    return false;
+  }
+  stateRofl.serverPassword = password;
+  return true;
+}
 
-  stateRofl.socket.binaryType = "arraybuffer";
+async function connectWebSocket() {
+  if (!stateRofl.serverPassword && !(await promptForPassword())) {
+    return;
+  }
 
-  stateRofl.socket.onopen = () => {
-    console.log("WebSocket connection opened");
+  const socket = new WebSocket(WEBSOCKET_URL);
+  
+  socket.onopen = () => {
+    console.log("WebSocket connected");
+    // Send authentication immediately after connection
+    socket.send(JSON.stringify({
+      type: "auth",
+      password: stateRofl.serverPassword
+    }));
   };
 
-  stateRofl.socket.onmessage = (event) => {
+  socket.binaryType = "arraybuffer";
+
+  socket.onmessage = (event) => {
     const blob = new Blob([event.data], { type: "image/jpeg" });
     const url = URL.createObjectURL(blob);
 
@@ -337,11 +357,13 @@ function connectWebSocket() {
     img.src = url;
   };
 
-  stateRofl.socket.onclose = reconnectWebSocket;
+  socket.onclose = reconnectWebSocket;
 
-  stateRofl.socket.onerror = (error) => {
+  socket.onerror = (error) => {
     console.error("WebSocket error:", error);
   };
+
+  stateRofl.socket = socket;
 }
 
 async function reconnectWebSocket() {
@@ -432,6 +454,11 @@ function renderFrames() {
 }
 
 function sendPrompt() {
+  if (!stateRofl.serverPassword) {
+    alert("Please enter the server password first");
+    return;
+  }
+
   const promptText = document.getElementById("prompt").value;
   const postText = document.getElementById("postText").value;
   const encodedPrompt = encodeURIComponent(`${promptText + " " + postText}`);
@@ -439,8 +466,18 @@ function sendPrompt() {
 
   fetch(endpoint, {
     method: "POST",
+    headers: {
+      'Authorization': `Bearer ${stateRofl.serverPassword}`
+    }
   })
-    .then((response) => response.text())
+    .then((response) => {
+      if (response.status === 401) {
+        stateRofl.serverPassword = null;
+        promptForPassword();
+        throw new Error("Invalid password");
+      }
+      return response.text();
+    })
     .then((data) => console.log(data))
     .catch((error) => {
       console.error("Error:", error);

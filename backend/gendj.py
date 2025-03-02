@@ -29,8 +29,10 @@ import os
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.utils.download_util import load_file_from_url
 from realesrgan import RealESRGANer
+import json
 
 from websockets.server import serve
+from config import load_server_config
 
 
 class ThreadedWebsocket(ThreadedWorker):
@@ -48,6 +50,7 @@ class ThreadedWebsocket(ThreadedWorker):
         self.cleanup_called = False
         self.max_queue_size = settings.batch_size * 3
         self.active_connections = set()
+        self.authenticated_connections = set()
         self.connection_lock = threading.Lock()
         self.heartbeat_interval = 30
         self.connection_timeout = 90
@@ -104,49 +107,65 @@ class ThreadedWebsocket(ThreadedWorker):
 
     async def handler(self, websocket, path):
         """Handle a single WebSocket connection"""
-        with self.connection_lock:
-            self.active_connections.add(websocket)
-            self.last_heartbeat[websocket] = time.time()
-            self.frame_processors[websocket] = {
-                'last_frame_time': 0,
-                'frames_processed': 0
-            }
-        
-        print(f"WebSocket connection opened. Active connections: {len(self.active_connections)}")
-        
         try:
-            async for message in websocket:
-                try:
-                    # Handle heartbeat
-                    if message == 'pong':
-                        self.last_heartbeat[websocket] = time.time()
-                        continue
+            # Wait for authentication
+            auth_message = await websocket.recv()
+            try:
+                auth_data = json.loads(auth_message)
+                if (auth_data.get("type") == "auth" and 
+                    auth_data.get("password") == self.settings.server_password):
+                    self.authenticated_connections.add(websocket)
+                else:
+                    await websocket.close(1008, "Invalid authentication")
+                    return
+            except json.JSONDecodeError:
+                await websocket.close(1008, "Invalid authentication format")
+                return
 
-                    # Process frame
-                    current_time = time.time()
-                    processor_state = self.frame_processors[websocket]
-                    
-                    # Rate limiting check
-                    time_since_last = current_time - processor_state['last_frame_time']
-                    if time_since_last < self.frame_interval * 0.9:  # Allow 10% variance
-                        continue
+            with self.connection_lock:
+                self.active_connections.add(websocket)
+                self.last_heartbeat[websocket] = time.time()
+                self.frame_processors[websocket] = {
+                    'last_frame_time': 0,
+                    'frames_processed': 0
+                }
+            
+            print(f"WebSocket connection opened. Active connections: {len(self.active_connections)}")
+            
+            try:
+                async for message in websocket:
+                    try:
+                        # Handle heartbeat
+                        if message == 'pong':
+                            self.last_heartbeat[websocket] = time.time()
+                            continue
+
+                        # Process frame
+                        current_time = time.time()
+                        processor_state = self.frame_processors[websocket]
                         
-                    await self.process_frame(websocket, message)
-                    processor_state['last_frame_time'] = current_time
-                    processor_state['frames_processed'] += 1
+                        # Rate limiting check
+                        time_since_last = current_time - processor_state['last_frame_time']
+                        if time_since_last < self.frame_interval * 0.9:  # Allow 10% variance
+                            continue
+                            
+                        await self.process_frame(websocket, message)
+                        processor_state['last_frame_time'] = current_time
+                        processor_state['frames_processed'] += 1
 
-                except Exception as e:
-                    print(f"Error handling message: {e}")
-                    await asyncio.sleep(0.1)
-                    continue
+                    except Exception as e:
+                        print(f"Error handling message: {e}")
+                        await asyncio.sleep(0.1)
+                        continue
 
-        except websockets.exceptions.ConnectionClosed:
-            print("Connection closed normally")
+            except websockets.exceptions.ConnectionClosed:
+                print("Connection closed normally")
         except Exception as e:
             print(f"Connection error: {e}")
         finally:
             with self.connection_lock:
-                self.active_connections.remove(websocket)
+                self.active_connections.discard(websocket)
+                self.authenticated_connections.discard(websocket)
                 self.last_heartbeat.pop(websocket, None)
                 self.frame_processors.pop(websocket, None)
             print(f"WebSocket connection closed. Remaining connections: {len(self.active_connections)}")
@@ -475,4 +494,6 @@ def main():
 
 
 if __name__ == "__main__":
+    config = load_server_config()
+    print(f"Server password configured: {bool(config.SERVER_PASSWORD)}")
     main()

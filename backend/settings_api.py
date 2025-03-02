@@ -1,12 +1,13 @@
 import threading
 import uvicorn
-from fastapi import FastAPI, Request, UploadFile, File
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import aiofiles
 import os
 import tempfile
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import time
 import json
@@ -21,8 +22,10 @@ class SettingsAPI:
     def __init__(self, settings):
         self.shutdown = False
         self.settings = settings
+        print(f"Settings API initialized with password configured: {bool(settings.server_password)}")  # Debug line
         port = settings.settings_port
         self.app = FastAPI()
+        self.security = HTTPBearer()
         self.setup_routes()
         self.thread = threading.Thread(target=self.run_server, args=(port,))
         # Add a thread pool with thread naming for better cleanup
@@ -56,6 +59,18 @@ class SettingsAPI:
         if not self.thread.is_alive():
             self.thread.start()
 
+    def verify_token(self, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+        """Verify the authentication token"""
+        print(f"Verifying token against password: {bool(self.settings.server_password)}")  # Debug line
+        if not credentials or credentials.credentials != self.settings.server_password:
+            print("Invalid authentication credentials")  # Debug line
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid authentication credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return credentials.credentials
+
     def setup_routes(self):
         app = self.app
         app.add_middleware(
@@ -67,7 +82,8 @@ class SettingsAPI:
         )
 
         @app.post("/prompt/{msg}")
-        async def prompt(msg: str):
+        async def prompt(msg: str, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             prompt = msg
 
             override = "-f" in prompt
@@ -86,7 +102,8 @@ class SettingsAPI:
             return {"safety": "safe"}
 
         @app.post("/secondprompt/{msg}")
-        async def secondprompt(msg: str):
+        async def secondprompt(msg: str, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             prompt = msg
 
             override = "-f" in prompt
@@ -105,7 +122,8 @@ class SettingsAPI:
             return {"safety": "safe"}
 
         @app.post("/blend/{msg}")
-        async def blend(msg: str):
+        async def blend(msg: str, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             try:
                 blend_value = float(msg)
                 if 0 <= blend_value <= 1:
@@ -121,74 +139,89 @@ class SettingsAPI:
                 return {"status": "error", "message": "Invalid blend value"}
 
         @app.get("/directory/{status}")
-        async def directory(status: str):
+        async def directory(status: str, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.directory = "data/" + status
             print("Updated directory status:", self.settings.directory)
             return {"status": "updated"}
 
         @app.get("/debug/{status}")
-        async def debug(status: bool):
+        async def debug(status: bool, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.debug = status
             print("Updated debug status:", status)
             return {"status": "updated"}
 
         @app.get("/compel/{status}")
-        async def compel(status: bool):
+        async def compel(status: bool, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.compel = status
             print("Updated compel status:", status)
             return {"status": "updated"}
 
         @app.get("/passthrough/{status}")
-        async def passthrough(status: bool):
+        async def passthrough(status: bool, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.passthrough = status
             print("Updated passthrough status:", self.settings.passthrough)
             return {"status": "updated"}
 
         @app.get("/fixed_seed/{status}")
-        async def fixed_seed(status: bool):
+        async def fixed_seed(status: bool, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.fixed_seed = status
             print("Updated fixed_seed status:", self.settings.fixed_seed)
             return {"status": "updated"}
 
         @app.get("/mirror/{status}")
-        async def mirror(status: bool):
+        async def mirror(status: bool, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.mirror = status
             print("Updated mirror status:", status)
             return {"status": "updated"}
 
         @app.get("/batch_size/{value}")
-        async def batch_size(value: int):
+        async def batch_size(value: int, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.batch_size = value
             print("Updated batch_size:", self.settings.batch_size)
             return {"status": "updated"}
 
         @app.get("/seed/{value}")
-        async def seed(value: int):
+        async def seed(value: int, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.seed = value
             print("Updated seed:", self.settings.seed)
             return {"status": "updated"}
 
         @app.get("/steps/{value}")
-        async def steps(value: int):
+        async def steps(value: int, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.num_inference_steps = value
             print("Updated num_inference_steps:", self.settings.num_inference_steps)
             return {"status": "updated"}
 
         @app.get("/strength/{value}")
-        async def strength(value: float):
+        async def strength(value: float, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             self.settings.strength = value
             print("Updated strength:", self.settings.strength)
             return {"status": "updated"}
 
         @app.get("/opacity/{value}")
-        async def opacity(value: float):
+        async def opacity(value: float, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
             value = min(max(value, 0), 1)
             self.settings.opacity = value
             print("Updated opacity:", self.settings.opacity)
             return {"status": "updated"}
 
         @app.post("/transcribe")
-        async def transcribe_audio(audio: UploadFile = File(...)):
+        async def transcribe(
+            file: UploadFile = File(...),
+            credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())
+        ):
+            token = self.verify_token(credentials)
             # Check if we're already transcribing
             if self._transcribing:
                 print("⚠️ Already processing audio, skipping new request")
@@ -202,7 +235,7 @@ class SettingsAPI:
                         return {"error": "Already processing audio"}
                     self._transcribing = True
 
-                content = await audio.read()
+                content = await file.read()
                 print(f"Received audio data of size: {len(content)} bytes")
                 
                 # Use our dedicated executor with timeout
@@ -237,6 +270,19 @@ class SettingsAPI:
                 traceback.print_exc()
                 self._transcribing = False
                 return {"error": str(e)}
+
+        @app.post("/auth/verify")
+        async def verify_auth(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            """Verify the authentication token"""
+            try:
+                token = self.verify_token(credentials)
+                return {"status": "authenticated"}
+            except HTTPException:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Invalid authentication credentials",
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
 
         if "READY_WEBHOOK_URL" not in os.environ:
             app.mount("/", StaticFiles(directory="fe", html=True), name="static")
