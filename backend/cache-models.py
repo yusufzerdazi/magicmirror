@@ -21,7 +21,6 @@ class DiffusionProcessor:
         )
 
         print("Models loaded")
-
         # Other initializations (e.g., compiling the model) can go here
 
     def save_models(

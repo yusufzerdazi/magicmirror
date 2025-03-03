@@ -176,9 +176,9 @@ class DiffusionProcessor:
         return self.pipe(
             image=images,
             generator=self.generator,
-            num_inference_steps=num_inference_steps,
+            num_inference_steps=5,
             guidance_scale=0,
-            strength=strength,
+            strength=0.65,
             output_type="np",
             **kwargs,
         ).images

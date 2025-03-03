@@ -40,7 +40,7 @@ class SettingsAPI:
         self.prompt_1 = "A psychedelic landscape."
         self.blend = 0
         self.speech_processor = SpeechProcessor(device="cuda")
-        self.base_prompt = "You are Mischief, a magic mirror at a party. You listen to words in your surroundings and create a fun visual based on the words - all in a fun pastel cartoon style. You've recently heard people nearby say:"
+        self.base_prompt = "photorealistic: "
         print("Speech processor initialized")
 
     def update_blend(self):
@@ -216,6 +216,21 @@ class SettingsAPI:
             print("Updated opacity:", self.settings.opacity)
             return {"status": "updated"}
 
+        def has_excessive_repetition(text: str) -> bool:
+            # Check for repeated phrases of 5 or more words
+            words = text.split()
+            if len(words) < 10:  # Don't check very short phrases
+                return False
+            
+            # Look for repeated sequences
+            for length in range(5, len(words) // 2):
+                for i in range(len(words) - length * 2):
+                    phrase = ' '.join(words[i:i+length])
+                    rest_of_text = ' '.join(words[i+length:])
+                    if rest_of_text.count(phrase) > 1:  # Found same phrase multiple times
+                        return True
+            return False
+
         @app.post("/transcribe")
         async def transcribe(
             file: UploadFile = File(...),
@@ -252,8 +267,14 @@ class SettingsAPI:
                 if transcribed_text:
                     print(f"🎤 Transcribed: '{transcribed_text}'")
                     
+                    # Skip if excessive repetition detected
+                    if has_excessive_repetition(transcribed_text):
+                        print("⚠️ Excessive repetition detected, skipping")
+                        self._transcribing = False
+                        return {"error": "Excessive repetition detected"}
+                        
                     # Generate and set new prompt
-                    new_prompt = f"{self.base_prompt} '{transcribed_text}', transport your unexpecting subjects there"
+                    new_prompt = f"{self.base_prompt} '{transcribed_text}'"
                     print(f"🔄 Setting new prompt: {new_prompt}")
                     self.settings.prompt = new_prompt
                     
