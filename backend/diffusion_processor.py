@@ -23,6 +23,8 @@ class DiffusionProcessor:
         self, warmup=None, local_files_only=True, use_cached=False, settings=None
     ):
         self.settings = settings
+        self.last_tint_switch = time.time()
+        self.use_first_tint = True
         print("Settings2:", settings)
 
         if use_cached:
@@ -157,26 +159,67 @@ class DiffusionProcessor:
         pool = pool1 * t1 + pool2 * t2
         return cond, pool
 
+    def apply_tint(self, images, color):
+        # Convert color to float32 tensor and normalize to 0-1
+        color = torch.tensor(color, dtype=torch.float32, device='cuda') / 255.0
+        
+        # Print input shapes for debugging
+        print(f"Images shape before: {images.shape}, dtype: {images.dtype}")
+        
+        # Reshape color to match image dimensions (B, C, H, W format)
+        color = color.reshape(1, 3, 1, 1)
+        
+        # Convert images to float32 if they aren't already
+        images = images.to(dtype=torch.float32)
+        
+        # Print shapes for debugging
+        print(f"Images shape: {images.shape}, Color shape: {color.shape}")
+        
+        # Blend original image with tint color
+        tinted = images * (1 - self.settings.tint_strength) + color * self.settings.tint_strength
+        
+        # Convert back to original dtype
+        tinted = tinted.to(dtype=images.dtype)
+        
+        # Ensure values stay in valid range
+        return torch.clamp(tinted, 0, 1)
+
     def run(
         self, images, prompt, num_inference_steps, strength, use_compel=True, seed=None
     ):
+        # Check if it's time to switch tints
+        current_time = time.time()
+        if current_time - self.last_tint_switch >= self.settings.tint_interval:
+            self.use_first_tint = not self.use_first_tint
+            self.last_tint_switch = current_time
+
+        # Print input image shape and type for debugging
+        print(f"Input images shape: {images.shape}, dtype: {images.dtype}")
+
+        # Flip images horizontally using torch operations
+        flipped_images = torch.flip(images, dims=[-1])  # Changed to -1 since width is last dim
+        
+        # Apply current tint
+        tint_color = self.settings.tint_color_1 if self.use_first_tint else self.settings.tint_color_2
+        processed_images = self.apply_tint(flipped_images, tint_color)
+
         strength = min(max(1 / num_inference_steps, strength), 1)
         if seed is not None:
             self.generator = torch.manual_seed(seed)
         kwargs = {}
         if use_compel:
             conditioning, pooled = self.meta_embed_prompt(prompt)
-            batch_size = len(images)
+            batch_size = len(processed_images)
             conditioning_batch = conditioning.expand(batch_size, -1, -1)
             pooled_batch = pooled.expand(batch_size, -1)
             kwargs["prompt_embeds"] = conditioning_batch
             kwargs["pooled_prompt_embeds"] = pooled_batch
         else:
-            kwargs["prompt"] = [prompt] * len(images)
+            kwargs["prompt"] = [prompt] * len(processed_images)
         return self.pipe(
-            image=images,
+            image=processed_images,
             generator=self.generator,
-            num_inference_steps=5,
+            num_inference_steps=2,
             guidance_scale=0,
             strength=0.65,
             output_type="np",

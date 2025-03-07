@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     fps: int = Field(default=30)
     directory: str = Field(default="data/frames")
 
+    # tint settings
+    tint_strength: float = Field(default=0.1)
+    tint_interval: int = Field(default=300)  # 5 minutes in seconds
+    tint_color_1: tuple = Field(default=(255, 165, 0))  # orange
+    tint_color_2: tuple = Field(default=(255, 192, 203))  # pink
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         try:
