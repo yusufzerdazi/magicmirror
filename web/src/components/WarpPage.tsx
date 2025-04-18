@@ -7,12 +7,17 @@ const INITIAL_PROMPT = "a mischievous cat with a third eye, matte pastel colour 
 const FRAME_INTERVAL = 250; // Send 4 frames per second
 const MAX_BUFFER_SIZE = 16; // Don't let buffer grow too large
 const DISPLAY_DURATION = 0; // Time to show each frame before transition
-const AUDIO_INTERVAL = 5000; // Process audio every 5 seconds
+const AUDIO_INTERVAL = 10000; // Process audio every 5 seconds
 const SCROLL_DURATION = 5; // Seconds to keep text visible
-const COIN_RELATIVE_SIZE = 0.10; // 10% of container width
+const COIN_RELATIVE_SIZE = 0.05; // 10% of container width
 const ROTATION_DURATION = 3; // Seconds for one full rotation
-const LEFT_PATH = "M 0 300 C 100 350 200 250 300 300 C 350 350 400 250 450 300";  // Left wobbly curve
-const RIGHT_PATH = "M 450 300 C 500 250 550 350 600 300 C 650 350 700 250 900 300";  // Right wobbly curve
+const PATH_BASE_Y = 350;  // Base Y position for the paths
+const PATH_AMPLITUDE = 50;  // How much the path waves up and down
+const LEFT_PATH = `M 0 ${PATH_BASE_Y} C 100 ${PATH_BASE_Y + PATH_AMPLITUDE} 200 ${PATH_BASE_Y - PATH_AMPLITUDE} 300 ${PATH_BASE_Y} C 350 ${PATH_BASE_Y + PATH_AMPLITUDE} 400 ${PATH_BASE_Y - PATH_AMPLITUDE} 450 ${PATH_BASE_Y}`;
+const RIGHT_PATH = `M 450 ${PATH_BASE_Y} C 500 ${PATH_BASE_Y - PATH_AMPLITUDE} 550 ${PATH_BASE_Y + PATH_AMPLITUDE} 600 ${PATH_BASE_Y} C 650 ${PATH_BASE_Y + PATH_AMPLITUDE} 700 ${PATH_BASE_Y - PATH_AMPLITUDE} 900 ${PATH_BASE_Y}`;
+
+// Add new constant for env password
+const ENV_PASSWORD = import.meta.env.VITE_WARP_PASSWORD;
 
 type TranscriptEntry = {
   text: string;
@@ -27,11 +32,11 @@ type DeviceInfo = {
 type Rotation = 0 | 90 | 180 | 270;
 
 const buildWebsocketUrl = () => {
-  return `ws://192.168.1.113:8765`;
+  return `${import.meta.env.VITE_API_URL}:8765`;
 };
 
 const buildPromptEndpointUrl = () => {
-  return `http://192.168.1.113:5556/prompt/`;
+  return `${import.meta.env.VITE_API_URL}:5556/prompt/`;
 };
 
 // First, move the PasswordAuth component to be an overlay
@@ -52,7 +57,7 @@ const PageContainer: React.FC<{ children: React.ReactNode }> = ({ children }) =>
       <div 
         className="relative bg-black h-screen"
         style={{
-          width: 'calc(9/16 * 100vh)', // Force 9:16 ratio based on height
+          width: 'calc(16/9 * 100vh)', // Force 9:16 ratio based on height
           maxWidth: '100vw',           // Don't overflow viewport width
         }}
       >
@@ -87,6 +92,7 @@ const WarpPage = () => {
   const [serverPassword, setServerPassword] = useState<string | null>(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authToken, setAuthToken] = useState<string | null>(null);
+  const [showPreview, setShowPreview] = useState(false);
 
   const addTranscript = (text: string) => {
     setTotalTranscripts(prev => prev + 1);
@@ -238,7 +244,7 @@ const WarpPage = () => {
           
           const fade = () => {
             if (opacity > 0 && currentCanvasRef.current) {
-              opacity -= 0.02; // 20 steps for smooth fade
+              opacity -= 0.05;
               currentCanvasRef.current.style.opacity = opacity.toString();
               requestAnimationFrame(fade);
             } else {
@@ -246,7 +252,7 @@ const WarpPage = () => {
               const temp = currentCanvasRef.current;
               currentCanvasRef.current = nextCanvasRef.current;
               nextCanvasRef.current = temp;
-
+              
               // Update z-indices to keep current canvas on top
               if (currentCanvasRef.current) {
                 currentCanvasRef.current.style.zIndex = '2';
@@ -334,7 +340,7 @@ const WarpPage = () => {
     formData.append('file', audioBlob);
 
     try {
-      const response = await fetch(`http://192.168.1.113:5556/transcribe`, {
+      const response = await fetch(`${import.meta.env.VITE_API_URL}:5556/transcribe`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${serverPassword}`
@@ -429,9 +435,9 @@ const WarpPage = () => {
     };
   }, [currentStream, wsStatus]);
 
-  // Add back the audio recording and processing
+  // Update the audio initialization effect
   useEffect(() => {
-    if (!isAuthenticated) return; // Only start audio recording when authenticated
+    if (!isAuthenticated) return;
 
     const initAudio = async () => {
       try {
@@ -443,6 +449,8 @@ const WarpPage = () => {
           }
         });
 
+        // Remove Web Audio API setup
+        // Just keep the MediaRecorder setup
         const mediaRecorder = new MediaRecorder(stream, {
           mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/ogg'
         });
@@ -460,6 +468,17 @@ const WarpPage = () => {
           const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
           audioChunksRef.current = [];
 
+          // Play back the recorded audio
+          const audioUrl = URL.createObjectURL(audioBlob);
+          const audio = new Audio(audioUrl);
+          audio.play();
+          
+          // Clean up the URL after playback
+          audio.onended = () => {
+            URL.revokeObjectURL(audioUrl);
+          };
+
+          // Send for transcription
           await transcribe(audioBlob);
         };
 
@@ -495,7 +514,7 @@ const WarpPage = () => {
     };
 
     initAudio();
-  }, [isAuthenticated]); // Only re-run when authentication status changes
+  }, [isAuthenticated]);
 
   useEffect(() => {
     const cleanup = setInterval(() => {
@@ -597,6 +616,13 @@ const WarpPage = () => {
     opacity: 1  // Remove transition, just keep opacity at 1
   };
 
+  // Check for env password on mount
+  useEffect(() => {
+    if (ENV_PASSWORD) {
+      handleAuthenticated(ENV_PASSWORD);
+    }
+  }, []);
+
   const handleAuthenticated = (password: string) => {
     setIsAuthenticated(true);
     setAuthToken(password);
@@ -607,7 +633,7 @@ const WarpPage = () => {
   const calculateCanvasDimensions = () => {
     const windowWidth = window.innerWidth;
     const windowHeight = window.innerHeight;
-    const targetAspect = 9/16; // Force 9:16 aspect ratio
+    const targetAspect = 16/9; // Force 9:16 aspect ratio
 
     let width, height;
     if (windowWidth / windowHeight > targetAspect) {
@@ -641,6 +667,18 @@ const WarpPage = () => {
     updateDimensions(); // Set initial dimensions
 
     return () => window.removeEventListener('resize', updateDimensions);
+  }, []);
+
+  // Add keyboard listener for 'H' key
+  useEffect(() => {
+    const handleKeyPress = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'h') {
+        setShowPreview(prev => !prev);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyPress);
+    return () => window.removeEventListener('keydown', handleKeyPress);
   }, []);
 
   // Modify the return statement to show both video and auth overlay
@@ -678,37 +716,39 @@ const WarpPage = () => {
         style={firstCanvasStyle}
       />
 
-      {/* Show auth overlay if not authenticated */}
-      {!isAuthenticated ? (
+      {/* Only show password overlay if no env password and not authenticated */}
+      {!isAuthenticated && !ENV_PASSWORD ? (
         <PasswordOverlay onAuthenticated={handleAuthenticated} />
       ) : (
         <>
           {/* Rest of the authenticated UI */}
-          <div className="absolute top-4 left-4 z-10 flex gap-2">
-            {videoDevices.length > 1 && (
+          {showPreview && (
+            <div className="absolute top-4 left-4 z-10 flex gap-2">
+              {videoDevices.length > 1 && (
+                <select
+                  className="bg-black/50 text-white px-4 py-2 rounded-full"
+                  value={selectedDeviceId}
+                  onChange={(e) => setSelectedDeviceId(e.target.value)}
+                >
+                  {videoDevices.map(device => (
+                    <option key={device.deviceId} value={device.deviceId}>
+                      {device.label}
+                    </option>
+                  ))}
+                </select>
+              )}
               <select
                 className="bg-black/50 text-white px-4 py-2 rounded-full"
-                value={selectedDeviceId}
-                onChange={(e) => setSelectedDeviceId(e.target.value)}
+                value={rotation}
+                onChange={(e) => setRotation(Number(e.target.value) as Rotation)}
               >
-                {videoDevices.map(device => (
-                  <option key={device.deviceId} value={device.deviceId}>
-                    {device.label}
-                  </option>
-                ))}
+                <option value={0}>0°</option>
+                <option value={90}>90°</option>
+                <option value={180}>180°</option>
+                <option value={270}>270°</option>
               </select>
-            )}
-            <select
-              className="bg-black/50 text-white px-4 py-2 rounded-full"
-              value={rotation}
-              onChange={(e) => setRotation(Number(e.target.value) as Rotation)}
-            >
-              <option value={0}>0°</option>
-              <option value={90}>90°</option>
-              <option value={180}>180°</option>
-              <option value={270}>270°</option>
-            </select>
-          </div>
+            </div>
+          )}
 
           <SvgPaths />
 
@@ -728,7 +768,7 @@ const WarpPage = () => {
                 return (
                   <text
                     key={transcript.timestamp}
-                    className="text-3xl font-bold fill-white drop-shadow-lg"
+                    className="text-lg font-bold fill-white drop-shadow-lg"
                     style={{
                       fontFamily: '"Sigmar", serif',
                     }}
@@ -752,11 +792,23 @@ const WarpPage = () => {
             style={{
               width: `${calculateCanvasDimensions().width * COIN_RELATIVE_SIZE}px`,
               height: `${calculateCanvasDimensions().width * COIN_RELATIVE_SIZE}px`,
-              bottom: '4%', // Move down by reducing the bottom percentage from 12% to 8%
+              bottom: '4%',
               perspective: '1000px',
               transformStyle: 'preserve-3d',
             }}
           >
+            <svg width="0" height="0">
+              <defs>
+                <filter id="blue-tint">
+                  <feFlood floodColor="#22A1EC" result="tint" />
+                  <feComposite in="tint" in2="SourceGraphic" operator="atop" />
+                </filter>
+                <filter id="pink-tint">
+                  <feFlood floodColor="#FFBAF1" result="tint" />
+                  <feComposite in="tint" in2="SourceGraphic" operator="atop" />
+                </filter>
+              </defs>
+            </svg>
             <div
               style={{
                 width: '100%',
@@ -766,33 +818,45 @@ const WarpPage = () => {
                 animation: `coin-rotate ${ROTATION_DURATION}s linear infinite`,
               }}
             >
-              <img
-                src="./mischief.jpg"
-                alt="Mischief"
-                className="absolute w-full h-full rounded-full object-cover"
-                style={{
-                  backfaceVisibility: 'hidden',
-                  transform: 'rotateY(0deg)',
-                  filter: 'brightness(1.2)',
-                }}
-              />
-              <img
-                src="./mischief.jpg"
-                alt="Mischief"
-                className="absolute w-full h-full rounded-full object-cover"
-                style={{
-                  backfaceVisibility: 'hidden',
-                  transform: 'rotateY(180deg)',
-                  filter: 'brightness(0.8)',
-                }}
-              />
+              <div className="absolute inset-0" style={{ backfaceVisibility: 'hidden', transform: 'rotateY(0deg)' }}>
+                <img
+                  src="./mischief.svg"
+                  alt="Mischief"
+                  className="absolute w-full h-full"
+                  style={{ filter: 'url(#blue-tint)' }}
+                />
+              </div>
+              <div className="absolute inset-0" style={{ backfaceVisibility: 'hidden', transform: 'rotateY(180deg)' }}>
+                <img
+                  src="./mischief.svg"
+                  alt="Mischief"
+                  className="absolute w-full h-full"
+                  style={{ filter: 'url(#pink-tint)' }}
+                />
+              </div>
             </div>
           </div>
 
-          {wsStatus !== 'connected' && (
+          {showPreview && wsStatus !== 'connected' && (
             <div className="absolute top-4 right-4 z-10 px-4 py-2 rounded-full bg-black/50 text-white">
               {wsStatus === 'connecting' ? 'Connecting...' : 'Reconnecting...'}
             </div>
+          )}
+
+          {/* Add preview video */}
+          {showPreview && frameQueueRef.current.length > 0 && (
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="absolute top-4 right-4 rounded-lg shadow-lg z-50"
+              style={{ 
+                width: '200px',
+                transform: applyRotationStyle(rotation),
+                opacity: 0.8,
+              }}
+            />
           )}
         </>
       )}
