@@ -16,6 +16,14 @@ const PATH_AMPLITUDE = 50;  // How much the path waves up and down
 const LEFT_PATH = `M 0 ${PATH_BASE_Y} C 100 ${PATH_BASE_Y + PATH_AMPLITUDE} 200 ${PATH_BASE_Y - PATH_AMPLITUDE} 300 ${PATH_BASE_Y} C 350 ${PATH_BASE_Y + PATH_AMPLITUDE} 400 ${PATH_BASE_Y - PATH_AMPLITUDE} 450 ${PATH_BASE_Y}`;
 const RIGHT_PATH = `M 450 ${PATH_BASE_Y} C 500 ${PATH_BASE_Y - PATH_AMPLITUDE} 550 ${PATH_BASE_Y + PATH_AMPLITUDE} 600 ${PATH_BASE_Y} C 650 ${PATH_BASE_Y + PATH_AMPLITUDE} 700 ${PATH_BASE_Y - PATH_AMPLITUDE} 900 ${PATH_BASE_Y}`;
 
+// Add new constants for reconnection and health check
+const MAX_RECONNECT_ATTEMPTS = 10;
+const INITIAL_RECONNECT_DELAY = 1000; // 1 second
+const MAX_RECONNECT_DELAY = 30000; // 30 seconds
+const HEALTH_CHECK_INTERVAL = 30000; // 30 seconds
+const MAX_NO_UPDATES_TIME = 300000; // 5 minutes
+const PING_INTERVAL = 10000; // 10 seconds
+
 // Add new constant for env password
 const ENV_PASSWORD = import.meta.env.VITE_WARP_PASSWORD;
 
@@ -93,6 +101,11 @@ const WarpPage = () => {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [showPreview, setShowPreview] = useState(false);
+  const reconnectAttemptsRef = useRef(0);
+  const lastFrameTimeRef = useRef(Date.now());
+  const healthCheckIntervalRef = useRef<NodeJS.Timeout>();
+  const pingIntervalRef = useRef<NodeJS.Timeout>();
+  const noUpdatesTimeoutRef = useRef<NodeJS.Timeout>();
 
   const addTranscript = (text: string) => {
     setTotalTranscripts(prev => prev + 1);
@@ -287,15 +300,59 @@ const WarpPage = () => {
       return;
     }
 
+    // Clear any existing timeouts
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+    }
+    if (healthCheckIntervalRef.current) {
+      clearInterval(healthCheckIntervalRef.current);
+    }
+    if (pingIntervalRef.current) {
+      clearInterval(pingIntervalRef.current);
+    }
+    if (noUpdatesTimeoutRef.current) {
+      clearTimeout(noUpdatesTimeoutRef.current);
+    }
+
+    // Close existing socket if any
+    if (socketRef.current) {
+      socketRef.current.close();
+    }
+
     const ws = new WebSocket(buildWebsocketUrl());
     
     ws.onopen = () => {
       console.log("WebSocket connected");
+      // Reset reconnection attempts on successful connection
+      reconnectAttemptsRef.current = 0;
       // Send authentication immediately after connection
       ws.send(JSON.stringify({
         type: "auth",
         password: serverPassword
       }));
+      setWsStatus('connected');
+
+      // Start health check
+      healthCheckIntervalRef.current = setInterval(() => {
+        const timeSinceLastFrame = Date.now() - lastFrameTimeRef.current;
+        if (timeSinceLastFrame > HEALTH_CHECK_INTERVAL) {
+          console.log("No frames received for too long, reconnecting...");
+          ws.close();
+        }
+      }, HEALTH_CHECK_INTERVAL);
+
+      // Start ping interval
+      pingIntervalRef.current = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "ping" }));
+        }
+      }, PING_INTERVAL);
+
+      // Reset no updates timeout
+      noUpdatesTimeoutRef.current = setTimeout(() => {
+        console.log("No updates for 5 minutes, refreshing page...");
+        window.location.reload();
+      }, MAX_NO_UPDATES_TIME);
     };
 
     ws.onmessage = (event) => {
@@ -307,19 +364,41 @@ const WarpPage = () => {
         img.onload = () => {
           URL.revokeObjectURL(url);
           frameQueueRef.current.push(img);
+          lastFrameTimeRef.current = Date.now();
         };
         img.src = url;
+      } else {
+        // Handle text messages (like pong)
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "pong") {
+            lastFrameTimeRef.current = Date.now();
+          }
+        } catch (e) {
+          console.error("Error parsing WebSocket message:", e);
+        }
       }
     };
 
     ws.onclose = () => {
       console.log("WebSocket closed");
       setWsStatus('disconnected');
-      // Try to reconnect
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
+      
+      // Calculate next reconnect delay with exponential backoff
+      const delay = Math.min(
+        INITIAL_RECONNECT_DELAY * Math.pow(2, reconnectAttemptsRef.current),
+        MAX_RECONNECT_DELAY
+      );
+      
+      reconnectAttemptsRef.current++;
+      
+      if (reconnectAttemptsRef.current <= MAX_RECONNECT_ATTEMPTS) {
+        console.log(`Attempting to reconnect in ${delay}ms (attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT_ATTEMPTS})`);
+        reconnectTimeoutRef.current = setTimeout(connectWebSocket, delay);
+      } else {
+        console.log("Max reconnection attempts reached, refreshing page...");
+        window.location.reload();
       }
-      reconnectTimeoutRef.current = setTimeout(connectWebSocket, 1000);
     };
 
     ws.onerror = (error) => {
@@ -327,7 +406,6 @@ const WarpPage = () => {
     };
 
     socketRef.current = ws;
-    setWsStatus('connected');
   }, [serverPassword]);
 
   // Modify transcribe function
@@ -679,6 +757,28 @@ const WarpPage = () => {
 
     window.addEventListener('keydown', handleKeyPress);
     return () => window.removeEventListener('keydown', handleKeyPress);
+  }, []);
+
+  // Cleanup function
+  useEffect(() => {
+    return () => {
+      // Cleanup all intervals and timeouts
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (healthCheckIntervalRef.current) {
+        clearInterval(healthCheckIntervalRef.current);
+      }
+      if (pingIntervalRef.current) {
+        clearInterval(pingIntervalRef.current);
+      }
+      if (noUpdatesTimeoutRef.current) {
+        clearTimeout(noUpdatesTimeoutRef.current);
+      }
+      if (socketRef.current) {
+        socketRef.current.close();
+      }
+    };
   }, []);
 
   // Modify the return statement to show both video and auth overlay

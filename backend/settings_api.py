@@ -1,6 +1,6 @@
 import threading
 import uvicorn
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -49,6 +49,8 @@ class SettingsAPI:
         self.blend = 0
         self.speech_processor = SpeechProcessor(device="cuda")
         self.base_prompt = "photorealistic: "
+        self.websocket_clients = set()  # Track connected WebSocket clients
+        self.last_ping_time = {}  # Track last ping time for each client
         print("Speech processor initialized")
 
     def update_blend(self):
@@ -240,71 +242,38 @@ class SettingsAPI:
             return False
 
         @app.post("/transcribe")
-        async def transcribe(
-            file: UploadFile = File(...),
-            credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())
-        ):
-            token = self.verify_token(credentials)
-            # Check if we're already transcribing
-            if self._transcribing:
-                print("⚠️ Already processing audio, skipping new request")
-                return {"error": "Already processing audio"}
-
-            print("Transcribing audio...")
+        async def transcribe(audio: UploadFile = File(...)):
             try:
-                # Acquire transcription lock
-                with self._transcribe_lock:
-                    if self._transcribing:
-                        return {"error": "Already processing audio"}
-                    self._transcribing = True
+                # Save the uploaded file temporarily
+                temp_path = f"temp_{audio.filename}"
+                with open(temp_path, "wb") as buffer:
+                    content = await audio.read()
+                    buffer.write(content)
 
-                content = await file.read()
-                print(f"Received audio data of size: {len(content)} bytes")
-                
-                # Use our dedicated executor with timeout
-                future = self.executor.submit(self.speech_processor.process_audio, content)
-                try:
-                    transcribed_text = await asyncio.get_event_loop().run_in_executor(
-                        None, future.result, 300  # 30 second timeout
+                # Transcribe the audio
+                with open(temp_path, "rb") as audio_file:
+                    transcript = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file
                     )
-                except TimeoutError:
-                    print("❌ Audio processing timed out")
-                    self._transcribing = False
-                    return {"error": "Audio processing timed out"}
-                
-                if transcribed_text:
-                    print(f"🎤 Transcribed: '{transcribed_text}'")
 
-                    words = [t.lower() for t in transcribed_text.split()]
-                    if any(word in banned_words for word in words):
-                        print("⚠️ Banned word detected, skipping")
-                        self._transcribing = False
-                        return {"text": "You said something too mischievious, I'm not going to repeat that."}
-                    
-                    # Skip if excessive repetition detected
-                    if has_excessive_repetition(transcribed_text):
-                        print("⚠️ Excessive repetition detected, skipping")
-                        self._transcribing = False
-                        return {"error": "Excessive repetition detected"}
-                        
-                    # Generate and set new prompt
-                    new_prompt = f"{self.base_prompt} '{transcribed_text}'"
-                    print(f"🔄 Setting new prompt: {new_prompt}")
-                    self.settings.prompt = new_prompt
-                    
-                    self._transcribing = False
-                    return {"text": transcribed_text}
-                else:
-                    print("❌ No text transcribed from audio")
-                    self._transcribing = False
-                    return {"error": "Failed to transcribe audio"}
-                    
+                # Clean up the temporary file
+                os.remove(temp_path)
+                print(transcript.text)
+                # Check for inappropriate content using the enhanced safety checker
+                safety_checker = SafetyChecker()
+                is_safe, safety_message = safety_checker.check_transcription(transcript.text)
+                print(is_safe)
+                if not is_safe:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=safety_message
+                    )
+
+                return {"text": transcript.text}
+
             except Exception as e:
-                print(f"❌ Error transcribing audio: {e}")
-                import traceback
-                traceback.print_exc()
-                self._transcribing = False
-                return {"error": str(e)}
+                raise HTTPException(status_code=500, detail=str(e))
 
         @app.post("/auth/verify")
         async def verify_auth(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
@@ -319,6 +288,40 @@ class SettingsAPI:
                     headers={"WWW-Authenticate": "Bearer"},
                 )
 
+        @app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            client_id = id(websocket)
+            self.websocket_clients.add(websocket)
+            self.last_ping_time[client_id] = time.time()
+            
+            try:
+                while True:
+                    try:
+                        data = await websocket.receive_json()
+                        
+                        if data.get("type") == "auth":
+                            if data.get("password") != self.settings.server_password:
+                                await websocket.close(code=1008, reason="Invalid password")
+                                break
+                            continue
+                            
+                        elif data.get("type") == "ping":
+                            self.last_ping_time[client_id] = time.time()
+                            await websocket.send_json({"type": "pong"})
+                            continue
+                            
+                    except WebSocketDisconnect:
+                        break
+                    except Exception as e:
+                        print(f"WebSocket error: {e}")
+                        break
+                        
+            finally:
+                self.websocket_clients.remove(websocket)
+                self.last_ping_time.pop(client_id, None)
+                await websocket.close()
+
         if "READY_WEBHOOK_URL" not in os.environ:
             app.mount("/", StaticFiles(directory="fe", html=True), name="static")
 
@@ -326,6 +329,30 @@ class SettingsAPI:
         import asyncio
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        
+        # Add health check task
+        async def health_check():
+            while not self.shutdown:
+                current_time = time.time()
+                disconnected_clients = []
+                
+                for client in self.websocket_clients:
+                    client_id = id(client)
+                    last_ping = self.last_ping_time.get(client_id, 0)
+                    if current_time - last_ping > 60:  # 1 minute timeout
+                        disconnected_clients.append(client)
+                
+                for client in disconnected_clients:
+                    try:
+                        await client.close(code=1000, reason="Health check timeout")
+                    except Exception as e:
+                        print(f"Error closing client: {e}")
+                    finally:
+                        self.websocket_clients.remove(client)
+                        self.last_ping_time.pop(id(client), None)
+                
+                await asyncio.sleep(30)  # Check every 30 seconds
+        
         config = uvicorn.Config(
             self.app,
             host="0.0.0.0",
@@ -335,7 +362,10 @@ class SettingsAPI:
             access_log=True
         )
         self._server = uvicorn.Server(config=config)
+        
         try:
+            # Start health check task
+            loop.create_task(health_check())
             loop.run_until_complete(self._server.serve())
         except Exception as e:
             print(f"Server error: {e}")
@@ -362,6 +392,15 @@ class SettingsAPI:
                     )
                 except Exception as e:
                     print(f"Error forcing thread shutdown: {e}")
+
+        # Close all WebSocket connections
+        for client in self.websocket_clients:
+            try:
+                asyncio.run(client.close(code=1000, reason="Server shutdown"))
+            except Exception as e:
+                print(f"Error closing WebSocket client: {e}")
+        self.websocket_clients.clear()
+        self.last_ping_time.clear()
 
         if self._server:
             self._server.should_exit = True
