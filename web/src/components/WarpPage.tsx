@@ -70,6 +70,7 @@ const PageContainer: React.FC<{ children: React.ReactNode }> = ({ children }) =>
 const WarpPage = () => {
   const [currentStream, setCurrentStream] = useState<MediaStream | null>(null);
   const [isRendering, setIsRendering] = useState(false);
+  const lastUpdateTime = useRef(Date.now());
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const croppedCanvasRef = useRef<HTMLCanvasElement>(null);
@@ -78,7 +79,6 @@ const WarpPage = () => {
   const socketRef = useRef<WebSocket | null>(null);
   const frameQueueRef = useRef<HTMLImageElement[]>([]);
   const isTransitioningRef = useRef(false);
-  const lastTransitionTime = useRef(Date.now());
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -186,7 +186,7 @@ const WarpPage = () => {
 
     const displayNextFrame = () => {
       const now = Date.now();
-      const timeSinceLastTransition = now - lastTransitionTime.current;
+      const timeSinceLastTransition = now - lastUpdateTime.current;
 
       if (!isTransitioningRef.current && 
           frameQueueRef.current.length > 0 && 
@@ -266,7 +266,7 @@ const WarpPage = () => {
               // Remove displayed frame from queue
               frameQueueRef.current = frameQueueRef.current.slice(1);
               
-              lastTransitionTime.current = Date.now();
+              lastUpdateTime.current = Date.now();
               isTransitioningRef.current = false;
             }
           };
@@ -300,6 +300,8 @@ const WarpPage = () => {
 
     ws.onmessage = (event) => {
       if (event.data instanceof Blob) {
+        // Update last update time when receiving a frame
+        lastUpdateTime.current = Date.now();
         // Handle binary frame data
         const blob = event.data;
         const url = URL.createObjectURL(blob);
@@ -329,6 +331,27 @@ const WarpPage = () => {
     socketRef.current = ws;
     setWsStatus('connected');
   }, [serverPassword]);
+
+  // Add new useEffect to check for stale updates
+  useEffect(() => {
+    const checkStaleUpdates = () => {
+      const now = Date.now();
+      const timeSinceLastUpdate = now - lastUpdateTime.current;
+      const FIVE_MINUTES = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+      if (timeSinceLastUpdate > FIVE_MINUTES) {
+        console.log("No updates received for 5 minutes, refreshing page...");
+        window.location.reload();
+      }
+    };
+
+    // Check every minute
+    const staleCheckInterval = setInterval(checkStaleUpdates, 60 * 1000);
+
+    return () => {
+      clearInterval(staleCheckInterval);
+    };
+  }, []);
 
   // Modify transcribe function
   const transcribe = async (audioBlob: Blob) => {
