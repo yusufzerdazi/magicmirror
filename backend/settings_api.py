@@ -17,6 +17,14 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from safety_checker import SafetyChecker
 from speech_processor import SpeechProcessor
 
+banned_words = [
+"Blood", "Bloodbath", "Crucifixion", "Bloody", "Flesh", "Bruises", "Car crash", "Corpse", "Crucified", "Cutting", "Decapitate", "Infested", "Gruesome", "Kill (as in Kill la Kill)", "Infected", "Sadist", "Slaughter", "Teratoma", "Tryphophobia", "Wound", "Cronenberg", "Khorne", "Cannibal", "Cannibalism", "Visceral", "Guts", "Bloodshot", "Gory", "Killing", "Surgery", "Vivisection", "Massacre", "Hemoglobin", "Suicide", "Female Body Parts",
+"Drugs", "Cocaine", "Heroin", "Meth", "Crack",
+"no clothes", "Speedo", "au naturale", "no shirt", "bare chest", "nude", "barely dressed", "bra", "risqué", "clear", "scantily", "clad", "cleavage", "stripped", "full frontal unclothed", "invisible clothes", "wearing nothing", "lingerie with no shirt", "naked", "without clothes on", "negligee", "zero clothes",
+"ahegao", "pinup", "ballgag", "Playboy", "Bimbo", "pleasure", "bodily fluids", "pleasures", "boudoir", "rule34", "brothel", "seducing", "dominatrix", "seductive", "erotic seductive", "fuck", "sensual", "Hardcore", "sexy", "Hentai", "Shag", "horny", "shibari (bondage in japanese)", "incest", "Smut", "jav", "succubus", "Jerk off king at pic", "thot", "kinbaku (bondage in japanese)", "transparent", "legs spread", "twerk", "making love", "voluptuous", "naughty", "wincest", "orgy", "Sultry", "XXX", "Bondage", "Bdsm", "Dog collar", "Slavegirl",
+"Torture", "Disturbing", "Farts", "Fart", "Poop", "Warts", "Xi Jinping", "Shit", "Pleasure", "Errect", "Big Black", "Brown pudding", "Bunghole", "Vomit", "Voluptuous", "Seductive", "Sperm", "Hot", "Sexy", "Sensored", "Censored", "Silenced", "Deepfake", "Inappropriate", "Pus", "Waifu", "mp5", "Succubus", "1488", "Surgery"
+]
+
 
 class SettingsAPI:
     def __init__(self, settings):
@@ -266,6 +274,12 @@ class SettingsAPI:
                 
                 if transcribed_text:
                     print(f"🎤 Transcribed: '{transcribed_text}'")
+
+                    words = [t.lower() for t in transcribed_text.split()]
+                    if any(word in banned_words for word in words):
+                        print("⚠️ Banned word detected, skipping")
+                        self._transcribing = False
+                        return {"text": "You said something too mischievious, I'm not going to repeat that."}
                     
                     # Skip if excessive repetition detected
                     if has_excessive_repetition(transcribed_text):
