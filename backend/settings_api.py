@@ -25,7 +25,6 @@ banned_words = [
 "Torture", "Disturbing", "Farts", "Fart", "Poop", "Warts", "Xi Jinping", "Shit", "Pleasure", "Errect", "Big Black", "Brown pudding", "Bunghole", "Vomit", "Voluptuous", "Seductive", "Sperm", "Hot", "Sexy", "Sensored", "Censored", "Silenced", "Deepfake", "Inappropriate", "Pus", "Waifu", "mp5", "Succubus", "1488", "Surgery"
 ]
 
-
 class SettingsAPI:
     def __init__(self, settings):
         self.shutdown = False
@@ -244,33 +243,25 @@ class SettingsAPI:
         @app.post("/transcribe")
         async def transcribe(audio: UploadFile = File(...)):
             try:
-                # Save the uploaded file temporarily
-                temp_path = f"temp_{audio.filename}"
-                with open(temp_path, "wb") as buffer:
-                    content = await audio.read()
-                    buffer.write(content)
-
-                # Transcribe the audio
-                with open(temp_path, "rb") as audio_file:
-                    transcript = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_file
-                    )
-
-                # Clean up the temporary file
-                os.remove(temp_path)
-                print(transcript.text)
+                content = await audio.read()
+                print(f"Received audio data of size: {len(content)} bytes")
+                
+                # Use our dedicated executor with timeout
+                future = self.executor.submit(self.speech_processor.process_audio, content)
+                transcribed_text = await asyncio.get_event_loop().run_in_executor(
+                    None, future.result, 300  # 30 second timeout
+                )
+                
                 # Check for inappropriate content using the enhanced safety checker
                 safety_checker = SafetyChecker()
-                is_safe, safety_message = safety_checker.check_transcription(transcript.text)
-                print(is_safe)
+                is_safe, safety_message = safety_checker.check_transcription(transcribed_text)
                 if not is_safe:
                     raise HTTPException(
                         status_code=400,
                         detail=safety_message
                     )
 
-                return {"text": transcript.text}
+                return {"text": transcribed_text}
 
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))

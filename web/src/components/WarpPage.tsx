@@ -415,7 +415,7 @@ const WarpPage = () => {
     }
 
     const formData = new FormData();
-    formData.append('file', audioBlob);
+    formData.append('audio', audioBlob, 'audio.webm');
 
     try {
       const response = await fetch(`${import.meta.env.VITE_API_URL}:5556/transcribe`, {
