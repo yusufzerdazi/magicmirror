@@ -29,13 +29,14 @@ class Settings(BaseSettings):
 
     # parameters for inference
     prompt: str = Field(default="A psychedelic landscape.")
-    num_inference_steps: int = Field(default=1)
+    num_inference_steps: int = Field(default=8)  # Higher steps for better quality
     fixed_seed: bool = Field(default=True)
     seed: int = Field(default=0)
     batch_size: int = Field(default=4)
-    strength: float = Field(default=0.25)
+    strength: float = Field(default=0.375)  # 37.5% - optimal for Lightning 8-step
     passthrough: bool = Field(default=False)
     compel: bool = Field(default=True)
+    model_type: str = Field(default="lightning")  # "lightning" or "turbo"
 
     # can be changed dynamically
     opacity: float = Field(default=1.0)
@@ -50,6 +51,14 @@ class Settings(BaseSettings):
     tint_interval: int = Field(default=300)  # 5 minutes in seconds
     tint_color_1: tuple = Field(default=(255, 165, 0))  # orange
     tint_color_2: tuple = Field(default=(255, 192, 203))  # pink
+    
+    # image compression settings
+    jpeg_quality: int = Field(default=90)  # JPEG quality (1-100), higher = better quality (increased from 75)
+    
+    # screenshot/snapshot settings
+    save_snapshots: bool = Field(default=True)  # Whether to save periodic snapshots
+    snapshot_interval: int = Field(default=300)  # Save snapshot every N seconds (default: 5 minutes)
+    snapshot_directory: str = Field(default="snapshots")  # Directory to save snapshots
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)

@@ -3,7 +3,7 @@ output
 test
 
 service_account.json
-
+snapshots
 
 *.pyc
 *.log

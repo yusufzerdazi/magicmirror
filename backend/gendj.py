@@ -26,9 +26,6 @@ import signal
 import sys
 import argparse
 import os
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from basicsr.utils.download_util import load_file_from_url
-from realesrgan import RealESRGANer
 import json
 
 from websockets.server import serve
@@ -273,43 +270,53 @@ class Processor(ThreadedWorker):
         self.jpeg = TurboJPEG()
         self.use_cached = use_cached
         self.max_queue_size = settings.batch_size * 2  # Store up to 2 batches worth of frames
+        self.diffusion_processor = None
 
     def setup(self):
-        warmup = None
-        if self.settings.warmup:
-            warmup = self.settings.warmup  # f"{settings.batch_size}x{settings.warmup}"
-            print(f"warmup from settings is: {warmup}")
-        self.diffusion_processor = DiffusionProcessor(
-            warmup=warmup, use_cached=self.use_cached, settings=self.settings
-        )
-
-        # Initialize Real-ESRGAN upscaler
-        model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=2)
-        weights_dir = 'weights'
-        
-        # Create weights directory if it doesn't exist
-        os.makedirs(weights_dir, exist_ok=True)
-        
-        model_url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth'
-        load_file_from_url(model_url, weights_dir)
-        print("Model downloaded successfully")
-            
-        self.upscaler = RealESRGANer(
-            scale=2,
-            model_path=os.path.join(weights_dir, 'RealESRGAN_x2plus.pth'),
-            model=model,
-            half=True,
-            tile=512,
-            tile_pad=32,
-            pre_pad=0,
-            device='cuda'
-        )
-        print("Upscaler initialized")
-
+        print("🚀 Processor setup starting...")
+        self.reload_model()
         self.clear_input()  # drop old frames
         self.runs = 0
+        print("✅ Processor setup complete")
+    
+    def reload_model(self):
+        """Reload the diffusion model (for hot-swapping)"""
+        print(f"🔄 ========== RELOADING MODEL ==========")
+        print(f"🔄 New model type: {self.settings.model_type}")
+        print(f"🔄 Steps: {self.settings.num_inference_steps}, Strength: {self.settings.strength}")
+        
+        warmup = None
+        if self.settings.warmup:
+            warmup = self.settings.warmup
+            print(f"warmup from settings is: {warmup}")
+        
+        try:
+            # Clean up old model if it exists
+            if self.diffusion_processor is not None:
+                print("🧹 Cleaning up old model...")
+                del self.diffusion_processor
+                torch.cuda.empty_cache()
+                print("✅ Old model cleaned up")
+            
+            # Load new model
+            print(f"📥 Loading new {self.settings.model_type} model...")
+            self.diffusion_processor = DiffusionProcessor(
+                warmup=warmup, use_cached=self.use_cached, settings=self.settings
+            )
+            print(f"✅ Model successfully loaded: {self.settings.model_type}")
+            print(f"✅ ========== RELOAD COMPLETE ==========")
+        except Exception as e:
+            print(f"❌ Error reloading model: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     def work(self, args):
+        # Check if diffusion processor is ready
+        if self.diffusion_processor is None:
+            print("⚠️ Diffusion processor not ready yet, skipping frame")
+            return
+        
         # Process only if we're not too backed up
         while self.input_queue.qsize() > self.max_queue_size:
             # Drop old frames if we're getting backed up
@@ -320,21 +327,27 @@ class Processor(ThreadedWorker):
 
         images, settings_batch = args
 
-        results = self.diffusion_processor.run(
-            images=images,
-            prompt=self.settings.prompt,
-            use_compel=True,
-            num_inference_steps=2,
-            strength=0.7,
-            seed=self.settings.seed,
-        )
+        try:
+            results = self.diffusion_processor.run(
+                images=images,
+                prompt=self.settings.prompt,
+                use_compel=True,
+                num_inference_steps=self.settings.num_inference_steps,
+                strength=self.settings.strength,
+                seed=self.settings.seed,
+            )
 
-        for frame_settings, image, result in zip(settings_batch, images, results):
-            # Upscale the result to 1080p
-            result_uint8 = (result * 255).astype(np.uint8)
-            upscaled, _ = self.upscaler.enhance(result_uint8, outscale=2.109375)  # Scale from 512 to 1080
-            result_bytes = self.jpeg.encode(upscaled, pixel_format=TJPF_RGB)
-            self.output_queue.put(result_bytes)
+            for frame_settings, image, result in zip(settings_batch, images, results):
+                # Convert to uint8 and encode directly (no upscaling)
+                result_uint8 = (result * 255).astype(np.uint8)
+                # Use quality setting for compression
+                result_bytes = self.jpeg.encode(result_uint8, pixel_format=TJPF_RGB, quality=self.settings.jpeg_quality)
+                self.output_queue.put(result_bytes)
+                
+        except Exception as e:
+            print(f"❌ Error in diffusion processing: {e}")
+            import traceback
+            traceback.print_exc()
         
         self.runs += 1
         if self.runs < 3:
@@ -351,9 +364,16 @@ class BroadcastStream(ThreadedWorker):
         self.threaded_websocket = threaded_websocket
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.batch_size = settings.batch_size
+        self.last_snapshot_time = 0
+        self.snapshot_counter = 0
 
     def setup(self):
         self.jpeg = TurboJPEG()
+        
+        # Create snapshot directory if it doesn't exist
+        if self.settings.save_snapshots:
+            os.makedirs(self.settings.snapshot_directory, exist_ok=True)
+            print(f"Snapshot directory ready: {self.settings.snapshot_directory}")
 
     def broadcast_msg(self, jpg):
         try:
@@ -367,6 +387,26 @@ class BroadcastStream(ThreadedWorker):
         except Exception as e:
             print(f"Error in broadcast_msg: {e}")
 
+    def save_snapshot(self, frame):
+        """Save a snapshot of the current frame"""
+        try:
+            from datetime import datetime
+            
+            # Generate filename with timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"snapshot_{timestamp}_{self.snapshot_counter:04d}.jpg"
+            filepath = os.path.join(self.settings.snapshot_directory, filename)
+            
+            # Save the JPEG data to file
+            with open(filepath, 'wb') as f:
+                f.write(frame)
+            
+            self.snapshot_counter += 1
+            print(f"📸 Snapshot saved: {filepath}")
+            
+        except Exception as e:
+            print(f"Error saving snapshot: {e}")
+    
     def work(self, frame):
         try:
             while self.input_queue.qsize() > self.settings.batch_size:
@@ -376,6 +416,14 @@ class BroadcastStream(ThreadedWorker):
                 self.broadcast_msg(frame)
             else:
                 print("No active WebSocket connection")
+            
+            # Check if it's time to save a snapshot
+            if self.settings.save_snapshots:
+                current_time = time.time()
+                if current_time - self.last_snapshot_time >= self.settings.snapshot_interval:
+                    self.save_snapshot(frame)
+                    self.last_snapshot_time = current_time
+                    
         except Exception as e:
             print(f"Error in work: {e}")
 
@@ -391,8 +439,12 @@ class BroadcastStream(ThreadedWorker):
 class GenDJ:
     def __init__(self):
         self.settings = Settings()
-        self.settings_api = SettingsAPI(self.settings)
         self.websocket = ThreadedWebsocket(self.settings)
+        
+        # Create processor first, then pass it to settings_api for model hot-swapping
+        # Note: This is a simplified version - full implementation would need proper processor
+        self.settings_api = SettingsAPI(self.settings)  # No processor reference in simple version
+        
         self.diffusion = DiffusionProcessor(self.settings)
         self.running = True
         # Set up signal handlers
@@ -442,12 +494,14 @@ def main():
     args = parser.parse_args()
 
     settings = Settings()
-    settings_api = SettingsAPI(settings)
     settings_controller = OscSettingsController(settings)
 
     receiver = ThreadedWebsocket(settings)
     processor = Processor(settings, use_cached=args.use_cached).feed(receiver)
     display = BroadcastStream(settings.output_port, settings, receiver).feed(processor)
+    
+    # Create settings API with processor reference for model hot-swapping
+    settings_api = SettingsAPI(settings, processor=processor)
 
     # Main program signal handling
     def signal_handler(signal, frame):

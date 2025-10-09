@@ -61,11 +61,11 @@ class OscSettingsController(ThreadedWorker):
             elif msg.address == "/mode":
                 mode = msg.params[0]
                 if mode == "soft":
-                    self.settings.num_inference_steps = 3
-                    self.settings.strength = 0.5
+                    self.settings.num_inference_steps = 8
+                    self.settings.strength = 0.25  # 25% - optimal for Lightning
                 elif mode == "hard":
-                    self.settings.num_inference_steps = 2
-                    self.settings.strength = 0.7               
+                    self.settings.num_inference_steps = 8
+                    self.settings.strength = 0.625  # 62.5% - optimal for Lightning               
             # else:
                 # print("unknown osc", msg.address, msg.params)
         except TypeError:

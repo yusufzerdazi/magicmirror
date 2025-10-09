@@ -27,9 +27,10 @@ banned_words = [
 
 
 class SettingsAPI:
-    def __init__(self, settings):
+    def __init__(self, settings, processor=None):
         self.shutdown = False
         self.settings = settings
+        self.processor = processor  # Reference to Processor for model reloading
         print(f"Settings API initialized with password configured: {bool(settings.server_password)}")  # Debug line
         port = settings.settings_port
         self.app = FastAPI()
@@ -48,7 +49,7 @@ class SettingsAPI:
         self.prompt_1 = "A psychedelic landscape."
         self.blend = 0
         self.speech_processor = SpeechProcessor(device="cuda")
-        self.base_prompt = "photorealistic: "
+        self.base_prompt = ""
         print("Speech processor initialized")
 
     def update_blend(self):
@@ -224,6 +225,65 @@ class SettingsAPI:
             print("Updated opacity:", self.settings.opacity)
             return {"status": "updated"}
 
+        @app.get("/jpeg_quality/{value}")
+        async def jpeg_quality(value: int, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
+            value = min(max(value, 1), 100)
+            self.settings.jpeg_quality = value
+            print("Updated jpeg_quality:", self.settings.jpeg_quality)
+            return {"status": "updated"}
+
+        @app.get("/snapshots/{status}")
+        async def snapshots(status: bool, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
+            self.settings.save_snapshots = status
+            print("Updated save_snapshots:", self.settings.save_snapshots)
+            return {"status": "updated"}
+
+        @app.get("/snapshot_interval/{value}")
+        async def snapshot_interval(value: int, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
+            value = max(value, 10)  # Minimum 10 seconds
+            self.settings.snapshot_interval = value
+            print("Updated snapshot_interval:", self.settings.snapshot_interval)
+            return {"status": "updated"}
+
+        @app.get("/settings")
+        async def get_settings(credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
+            return {
+                "model_type": self.settings.model_type,
+                "strength": self.settings.strength,
+                "num_inference_steps": self.settings.num_inference_steps,
+                "jpeg_quality": self.settings.jpeg_quality,
+                "save_snapshots": self.settings.save_snapshots,
+                "prompt": self.settings.prompt,
+            }
+
+        @app.post("/reload_model/{model_type}")
+        async def reload_model(model_type: str, credentials: HTTPAuthorizationCredentials = Depends(HTTPBearer())):
+            token = self.verify_token(credentials)
+            if model_type not in ["lightning", "turbo"]:
+                return {"status": "error", "message": "Invalid model type. Use 'lightning' or 'turbo'"}
+            
+            old_model = self.settings.model_type
+            self.settings.model_type = model_type
+            print(f"🔄 Model type changed: {old_model} → {model_type}")
+            
+            # Trigger model reload if processor reference exists
+            if self.processor and hasattr(self.processor, 'reload_model'):
+                try:
+                    self.processor.reload_model()
+                    return {"status": "success", "message": f"Model reloaded from {old_model} to {model_type}"}
+                except Exception as e:
+                    print(f"❌ Error reloading model: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return {"status": "error", "message": str(e)}
+            else:
+                print("⚠️ Warning: Processor reference not available")
+                return {"status": "pending", "message": "Model will reload on next startup"}
+
         def has_excessive_repetition(text: str) -> bool:
             # Check for repeated phrases of 5 or more words
             words = text.split()
@@ -288,7 +348,7 @@ class SettingsAPI:
                         return {"error": "Excessive repetition detected"}
                         
                     # Generate and set new prompt
-                    new_prompt = f"{self.base_prompt} '{transcribed_text}'"
+                    new_prompt = f"{transcribed_text}{self.base_prompt} "
                     print(f"🔄 Setting new prompt: {new_prompt}")
                     self.settings.prompt = new_prompt
                     

@@ -15,7 +15,7 @@ const PasswordAuth: React.FC<PasswordAuthProps> = ({ onAuthenticated }) => {
     setError('');
 
     try {
-      const response = await fetch('http://192.168.1.113:5556/auth/verify', {
+      const response = await fetch('http://localhost:5556/auth/verify', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${password}`,

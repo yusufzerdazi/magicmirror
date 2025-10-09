@@ -4,6 +4,7 @@ import time
 import os
 from fixed_seed import fix_seed
 import requests
+
 from sfast.compilers.stable_diffusion_pipeline_compiler import (
     compile,
     CompilationConfig,
@@ -20,46 +21,83 @@ from fixed_size_dict import FixedSizeDict
 
 class DiffusionProcessor:
     def __init__(
-        self, warmup=None, local_files_only=True, use_cached=False, settings=None
+        self, warmup=None, local_files_only=False, use_cached=False, settings=None
     ):
         self.settings = settings
         self.last_tint_switch = time.time()
         self.use_first_tint = True
         print("Settings2:", settings)
 
+        # Determine which model to use based on settings
+        model_type = settings.model_type if settings else "lightning"
+        
         if use_cached:
-            base_model = "./saved_pipeline/sdxl-turbo"
+            if model_type == "turbo":
+                base_model = "./saved_pipeline/sdxl-turbo"
+            else:
+                base_model = "./saved_pipeline/sdxl-lightning"
             vae_model = "./saved_pipeline/taesdxl"
         else:
-            base_model = "stabilityai/sdxl-turbo"
             vae_model = "madebyollin/taesdxl"
 
         warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
-
         disable_progress_bar()
 
-        if use_cached:
+        print(f"Loading SDXL model type: {model_type}")
+        
+        if model_type == "turbo":
+            # Load SDXL-Turbo
+            base_model = "stabilityai/sdxl-turbo"
+            print(f"Loading SDXL-Turbo from: {base_model}")
+            
             self.pipe = AutoPipelineForImage2Image.from_pretrained(
                 base_model,
                 torch_dtype=torch.float16,
                 variant="fp16",
                 local_files_only=local_files_only,
             )
-
+            
+            # Use Tiny VAE for speed
             self.pipe.vae = AutoencoderTiny.from_pretrained(
-                vae_model,
-                subfolder="diffusion_pytorch_model.fp16.safetensors",
-                torch_dtype=torch.float16,
-                local_files_only=local_files_only,
+                vae_model, torch_dtype=torch.float16, local_files_only=local_files_only
             )
         else:
+            # Load SDXL-Lightning
+            from diffusers import UNet2DConditionModel, EulerDiscreteScheduler
+            from huggingface_hub import hf_hub_download
+            from safetensors.torch import load_file
+            
+            base_model = "ByteDance/SDXL-Lightning"
+            print(f"Loading SDXL-Lightning from: {base_model}")
+            
+            # Load the base SDXL model
             self.pipe = AutoPipelineForImage2Image.from_pretrained(
-                base_model,
+                "stabilityai/stable-diffusion-xl-base-1.0",
                 torch_dtype=torch.float16,
                 variant="fp16",
                 local_files_only=local_files_only,
             )
-
+            
+            # Download and load Lightning UNet weights (8-step version for quality)
+            if not use_cached:
+                print("Loading SDXL-Lightning 8-step UNet...")
+                unet_path = hf_hub_download(
+                    repo_id=base_model,
+                    filename="sdxl_lightning_8step_unet.safetensors",
+                    local_files_only=local_files_only,
+                )
+                # Load the state dict and update the UNet
+                unet_state_dict = load_file(unet_path)
+                self.pipe.unet.load_state_dict(unet_state_dict)
+                print("Lightning UNet loaded")
+            
+            # Use Lightning's recommended scheduler
+            self.pipe.scheduler = EulerDiscreteScheduler.from_config(
+                self.pipe.scheduler.config,
+                timestep_spacing="trailing"
+            )
+            
+            # Use Tiny VAE for speed
             self.pipe.vae = AutoencoderTiny.from_pretrained(
                 vae_model, torch_dtype=torch.float16, local_files_only=local_files_only
             )
@@ -68,13 +106,20 @@ class DiffusionProcessor:
 
         print("Model loaded")
 
-        config = CompilationConfig.Default()
-        config.enable_xformers = True
-        config.enable_triton = True
-        config.enable_cuda_graph = True
-        self.pipe = compile(self.pipe, config=config)
-
-        print("Model compiled")
+        # Only compile SDXL-Turbo (Lightning has custom UNet that may not work with stable-fast)
+        if model_type == "turbo":
+            try:
+                config = CompilationConfig.Default()
+                config.enable_xformers = True
+                config.enable_triton = True
+                config.enable_cuda_graph = True
+                self.pipe = compile(self.pipe, config=config)
+                print("Model compiled with stable-fast")
+            except Exception as e:
+                print(f"Warning: Could not compile model: {e}")
+                print("Continuing without compilation")
+        else:
+            print("Skipping stable-fast compilation for Lightning (using native optimizations)")
 
         self.pipe.to(device="cuda", dtype=torch.float16)
         self.pipe.set_progress_bar_config(disable=True)
@@ -103,8 +148,8 @@ class DiffusionProcessor:
                     images=images,
                     prompt=self.settings.prompt,
                     use_compel=True,
-                    num_inference_steps=2,
-                    strength=0.7,
+                    num_inference_steps=self.settings.num_inference_steps,
+                    strength=self.settings.strength,
                     seed=self.settings.seed,
                 )
                 end_time = time.time()
@@ -194,7 +239,8 @@ class DiffusionProcessor:
             self.last_tint_switch = current_time
 
         # Print input image shape and type for debugging
-        print(f"Input images shape: {images.shape}, dtype: {images.dtype}")
+        print(f"🎨 Processing: steps={num_inference_steps}, strength={strength}")
+        print(f"📊 Input images shape: {images.shape}, dtype: {images.dtype}")
 
         # Flip images horizontally using torch operations
         flipped_images = torch.flip(images, dims=[-1])  # Changed to -1 since width is last dim
@@ -216,12 +262,15 @@ class DiffusionProcessor:
             kwargs["pooled_prompt_embeds"] = pooled_batch
         else:
             kwargs["prompt"] = [prompt] * len(processed_images)
-        return self.pipe(
+        result_images = self.pipe(
             image=processed_images,
             generator=self.generator,
-            num_inference_steps=2,
+            num_inference_steps=num_inference_steps,
             guidance_scale=0,
-            strength=0.65,
+            strength=strength,
             output_type="np",
             **kwargs,
         ).images
+        
+        print(f"✅ Generated {len(result_images)} images, shape: {result_images[0].shape}")
+        return result_images

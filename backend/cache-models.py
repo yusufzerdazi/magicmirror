@@ -5,23 +5,46 @@ from diffusion_processor import DiffusionProcessor
 
 
 class DiffusionProcessor:
-    def __init__(self, warmup=None, local_files_only=True):
-        base_model = "stabilityai/sdxl-turbo"
+    def __init__(self, warmup=None, local_files_only=False):
+        from diffusers import UNet2DConditionModel, EulerDiscreteScheduler
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        
+        base_sdxl = "stabilityai/stable-diffusion-xl-base-1.0"
+        lightning_model = "ByteDance/SDXL-Lightning"
         vae_model = "madebyollin/taesdxl"
 
+        # Load base SDXL
         self.pipe = AutoPipelineForImage2Image.from_pretrained(
-            base_model,
+            base_sdxl,
             torch_dtype=torch.float16,
             variant="fp16",
             local_files_only=local_files_only,
         )
+        
+        # Download and load Lightning UNet weights (8-step version)
+        print("Loading SDXL-Lightning 8-step UNet...")
+        unet_path = hf_hub_download(
+            repo_id=lightning_model,
+            filename="sdxl_lightning_8step_unet.safetensors",
+            local_files_only=local_files_only,
+        )
+        unet_state_dict = load_file(unet_path)
+        self.pipe.unet.load_state_dict(unet_state_dict)
+        print("Lightning UNet loaded")
+        
+        # Use Lightning's scheduler
+        self.pipe.scheduler = EulerDiscreteScheduler.from_config(
+            self.pipe.scheduler.config,
+            timestep_spacing="trailing"
+        )
 
+        # Use Tiny VAE
         self.pipe.vae = AutoencoderTiny.from_pretrained(
             vae_model, torch_dtype=torch.float16, local_files_only=local_files_only
         )
 
         print("Models loaded")
-        # Other initializations (e.g., compiling the model) can go here
 
     def save_models(
         self,
@@ -61,7 +84,7 @@ class DiffusionProcessor:
 
 # Example usage
 processor = DiffusionProcessor(local_files_only=False)
-save_dir_base = "./saved_pipeline/sdxl-turbo"
+save_dir_base = "./saved_pipeline/sdxl-lightning"
 save_dir_vae = "./saved_pipeline/taesdxl"
 processor.save_models(
     save_directory_base=save_dir_base,
