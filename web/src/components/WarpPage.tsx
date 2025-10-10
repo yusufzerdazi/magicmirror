@@ -52,7 +52,7 @@ const PasswordOverlay: React.FC<{ onAuthenticated: (password: string) => void }>
   );
 };
 
-const PageContainer: React.FC<{ children: React.ReactNode; circles: any[] }> = ({ children, circles }) => {
+const PageContainer: React.FC<{ children: React.ReactNode; circles: Array<{id: number; x: number; y: number; size: number; color: string; vx: number; vy: number; sizeVel: number}> }> = ({ children, circles }) => {
   return (
     <div className="fixed inset-0 flex items-center justify-center overflow-hidden">
       {/* Full-screen animated background */}
@@ -629,12 +629,124 @@ const WarpPage = () => {
     displayNextFrame();
   }, [isRendering, isFirstCanvasCurrent]);
 
-  // Modify WebSocket connection logic
+  // WebRTC Connection
+  const connectWebRTC = useCallback(async () => {
+    if (!serverPassword) return;
+    
+    try {
+      setRtcStatus('connecting');
+      console.log('🎥 Starting WebRTC connection...');
+      
+      // Create peer connection
+      const pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+      });
+      pcRef.current = pc;
+      
+      // Handle incoming video track
+      pc.ontrack = (event) => {
+        console.log('📺 Received video track', event);
+        console.log('Stream:', event.streams[0]);
+        console.log('Track kind:', event.track.kind);
+        
+        const stream = event.streams[0];
+        
+        if (webrtcVideoRef.current) {
+          console.log('Setting video srcObject');
+          webrtcVideoRef.current.srcObject = stream;
+          webrtcVideoRef.current.onloadedmetadata = () => {
+            console.log('✅ Video metadata loaded');
+            console.log('Video dimensions:', webrtcVideoRef.current?.videoWidth, 'x', webrtcVideoRef.current?.videoHeight);
+          };
+          webrtcVideoRef.current.onplay = () => {
+            console.log('✅ Video is playing');
+            setRtcStatus('connected');
+          };
+          webrtcVideoRef.current.play()
+            .then(() => console.log('✅ Video play() succeeded'))
+            .catch(e => console.error('❌ Error playing video:', e));
+        } else {
+          console.error('❌ webrtcVideoRef.current is null!');
+        }
+      };
+      
+      pc.onconnectionstatechange = () => {
+        console.log(`WebRTC connection state: ${pc.connectionState}`);
+        setRtcStatus(pc.connectionState as any);
+        if (pc.connectionState === 'failed') {
+          console.error('❌ WebRTC connection failed!');
+          // Don't fallback - we want to debug WebRTC
+        }
+      };
+      
+      pc.oniceconnectionstatechange = () => {
+        console.log(`ICE connection state: ${pc.iceConnectionState}`);
+      };
+      
+      pc.onicegatheringstatechange = () => {
+        console.log(`ICE gathering state: ${pc.iceGatheringState}`);
+      };
+      
+      // Add webcam video track to send to server
+      const videoTrack = currentStream?.getVideoTracks()[0];
+      if (videoTrack) {
+        pc.addTrack(videoTrack, currentStream);
+        console.log('📤 Added webcam track to peer connection');
+      }
+      
+      // Add transceiver to receive AI video from server
+      pc.addTransceiver('video', { direction: 'recvonly' });
+      
+      // Create offer
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      
+      console.log('Offer created and set');
+      
+      // Send offer to server
+      const response = await fetch(`${buildPromptEndpointUrl().replace('/prompt/', '')}/webrtc/offer`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${serverPassword}`,
+        },
+        body: JSON.stringify({
+          sdp: pc.localDescription?.sdp,
+          type: pc.localDescription?.type,
+        }),
+      });
+      
+      if (!response.ok) {
+        throw new Error(`WebRTC offer failed: ${response.statusText}`);
+      }
+      
+      const answer = await response.json();
+      console.log('📥 Received answer from server:', answer);
+      
+      if (!answer.sdp || !answer.type) {
+        throw new Error('Invalid answer from server: ' + JSON.stringify(answer));
+      }
+      
+      // Set remote description
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      
+      console.log('✅ WebRTC signaling complete, waiting for connection...');
+      
+    } catch (error) {
+      console.error('❌ WebRTC setup error:', error);
+      if (error instanceof Error) {
+        console.error('Error message:', error.message);
+        console.error('Error stack:', error.stack);
+      }
+      setRtcStatus('failed');
+    }
+  }, [serverPassword]);
+
   const connectWebSocket = useCallback(async () => {
     if (!serverPassword) {
       return;
     }
-    console.log(buildWebsocketUrl());
+    console.log('📡 Connecting to WebSocket...');
     const ws = new WebSocket(buildWebsocketUrl());
     
     ws.onopen = () => {
@@ -747,7 +859,7 @@ const WarpPage = () => {
     };
   }, [currentStream, serverPassword, connectWebSocket]);
 
-  // Send frames
+  // Send frames via WebSocket
   useEffect(() => {
     if (!currentStream || !socketRef.current || wsStatus !== 'connected') return;
 
@@ -1047,7 +1159,7 @@ const WarpPage = () => {
   // Modify the return statement to show both video and auth overlay
   return (
     <PageContainer circles={circles}>
-      {/* Move video inside container */}
+      {/* Webcam preview video */}
       <video
         ref={videoRef}
         autoPlay
@@ -1061,7 +1173,7 @@ const WarpPage = () => {
         }}
       />
 
-      {/* Move canvases inside container */}
+      {/* Canvas elements for rendering */}
       <canvas
         ref={croppedCanvasRef}
         width={FRAME_WIDTH}

@@ -26,6 +26,7 @@ class DiffusionProcessor:
         self.settings = settings
         self.last_tint_switch = time.time()
         self.use_first_tint = True
+        self.model_type = None  # Will be set after loading
         print("Settings2:", settings)
 
         # Determine which model to use based on settings
@@ -135,8 +136,11 @@ class DiffusionProcessor:
         self.prompt_cache = FixedSizeDict(32)
         print("Prepared compel")
 
+        print("Creating generator...")
         self.generator = torch.manual_seed(0)
-
+        print("Generator initialized")
+        
+        print(f"Warmup setting: {warmup}")
         if warmup:
             print("Starting warmup")
             warmup_shape = [int(e) for e in warmup.split("x")]
@@ -178,6 +182,8 @@ class DiffusionProcessor:
                         print(f"Failed to notify webhook. Status code: {response.status_code}")
                 except Exception as e:
                     print(f"Error notifying webhook: {e}")
+        
+        print("✅ DiffusionProcessor initialization complete!")
 
     def embed_prompt(self, prompt):
         if prompt not in self.prompt_cache:

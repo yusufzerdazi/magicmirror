@@ -281,6 +281,13 @@ class Processor(ThreadedWorker):
     
     def reload_model(self):
         """Reload the diffusion model (for hot-swapping)"""
+        # Check if we already have the requested model loaded
+        if self.diffusion_processor is not None:
+            current_model = getattr(self.diffusion_processor, 'model_type', None)
+            if current_model == self.settings.model_type:
+                print(f"ℹ️  Model '{self.settings.model_type}' already loaded, skipping reload")
+                return
+        
         print(f"🔄 ========== RELOADING MODEL ==========")
         print(f"🔄 New model type: {self.settings.model_type}")
         print(f"🔄 Steps: {self.settings.num_inference_steps}, Strength: {self.settings.strength}")
@@ -300,9 +307,13 @@ class Processor(ThreadedWorker):
             
             # Load new model
             print(f"📥 Loading new {self.settings.model_type} model...")
+            print(f"📥 Calling DiffusionProcessor.__init__()...")
             self.diffusion_processor = DiffusionProcessor(
                 warmup=warmup, use_cached=self.use_cached, settings=self.settings
             )
+            print(f"📥 DiffusionProcessor.__init__() returned")
+            # Store model type on processor for future checks
+            self.diffusion_processor.model_type = self.settings.model_type
             print(f"✅ Model successfully loaded: {self.settings.model_type}")
             print(f"✅ ========== RELOAD COMPLETE ==========")
         except Exception as e:
@@ -312,6 +323,15 @@ class Processor(ThreadedWorker):
             raise
 
     def work(self, args):
+        # Log first call
+        if not hasattr(self, '_processor_work_count'):
+            self._processor_work_count = 0
+            print(f"🔧 Processor.work() first call! Args type: {type(args)}")
+        self._processor_work_count += 1
+        
+        if self._processor_work_count % 10 == 0:
+            print(f"🔧 Processor.work() called {self._processor_work_count} times")
+        
         # Check if diffusion processor is ready
         if self.diffusion_processor is None:
             print("⚠️ Diffusion processor not ready yet, skipping frame")
@@ -337,12 +357,22 @@ class Processor(ThreadedWorker):
                 seed=self.settings.seed,
             )
 
+            # Log frame generation
+            if not hasattr(self, '_frame_gen_count'):
+                self._frame_gen_count = 0
+                print(f"🎨 Processor: First batch of {len(results)} frames generated!")
+                
             for frame_settings, image, result in zip(settings_batch, images, results):
                 # Convert to uint8 and encode directly (no upscaling)
                 result_uint8 = (result * 255).astype(np.uint8)
                 # Use quality setting for compression
                 result_bytes = self.jpeg.encode(result_uint8, pixel_format=TJPF_RGB, quality=self.settings.jpeg_quality)
                 self.output_queue.put(result_bytes)
+                
+                self._frame_gen_count += 1
+                
+            if self._frame_gen_count % 30 == 0:
+                print(f"🎨 Processor: {self._frame_gen_count} frames → output_queue (queue size: {self.output_queue.qsize()})")
                 
         except Exception as e:
             print(f"❌ Error in diffusion processing: {e}")
@@ -374,16 +404,25 @@ class BroadcastStream(ThreadedWorker):
         if self.settings.save_snapshots:
             os.makedirs(self.settings.snapshot_directory, exist_ok=True)
             print(f"Snapshot directory ready: {self.settings.snapshot_directory}")
+        
 
     def broadcast_msg(self, jpg):
+        # Log first call
+        if not hasattr(self, '_broadcast_count'):
+            self._broadcast_count = 0
+        self._broadcast_count += 1
+        
+        if self._broadcast_count % 30 == 0:
+            print(f"📡 broadcast_msg called {self._broadcast_count} times")
+        
         try:
+            # Send to WebSocket clients (legacy/fallback support)
             if self.threaded_websocket is not None:
                 future = asyncio.run_coroutine_threadsafe(
                     self.threaded_websocket.send_data(jpg), self.threaded_websocket.loop
                 )
                 future.result()  # Wait for the coroutine to complete
-            else:
-                print("No active WebSocket connection")
+            
         except Exception as e:
             print(f"Error in broadcast_msg: {e}")
 
@@ -408,14 +447,24 @@ class BroadcastStream(ThreadedWorker):
             print(f"Error saving snapshot: {e}")
     
     def work(self, frame):
+        # Log first call
+        if not hasattr(self, '_work_count'):
+            self._work_count = 0
+            print("🎬 BroadcastStream.work() starting...")
+        self._work_count += 1
+        
+        if self._work_count == 1:
+            print(f"📦 First frame received in BroadcastStream! Type: {type(frame)}, Size: {len(frame) if isinstance(frame, bytes) else 'unknown'}")
+        
+        if self._work_count % 30 == 0:
+            print(f"🎬 BroadcastStream.work() called {self._work_count} times, queue size: {self.input_queue.qsize()}")
+        
         try:
             while self.input_queue.qsize() > self.settings.batch_size:
                 frame = self.input_queue.get()
 
-            if self.threaded_websocket is not None:
-                self.broadcast_msg(frame)
-            else:
-                print("No active WebSocket connection")
+            # Always broadcast (to both WebSocket and WebRTC)
+            self.broadcast_msg(frame)
             
             # Check if it's time to save a snapshot
             if self.settings.save_snapshots:
@@ -498,10 +547,17 @@ def main():
 
     receiver = ThreadedWebsocket(settings)
     processor = Processor(settings, use_cached=args.use_cached).feed(receiver)
-    display = BroadcastStream(settings.output_port, settings, receiver).feed(processor)
     
     # Create settings API with processor reference for model hot-swapping
     settings_api = SettingsAPI(settings, processor=processor)
+    
+    # Create display for broadcasting
+    display = BroadcastStream(settings.output_port, settings, receiver).feed(processor)
+    
+    # Verify pipeline connections
+    print(f"🔗 Pipeline: receiver → processor → display")
+    print(f"🔗 processor.input_queue is receiver.output_queue: {processor.input_queue is receiver.output_queue}")
+    print(f"🔗 display.input_queue is processor.output_queue: {display.input_queue is processor.output_queue}")
 
     # Main program signal handling
     def signal_handler(signal, frame):
@@ -530,11 +586,19 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Start the components
+    print("🚀 ========== STARTING COMPONENTS ==========")
+    print("🚀 Starting settings_api...")
     settings_api.start()
+    print("🚀 Starting settings_controller...")
     settings_controller.start()
+    print("🚀 Starting display (BroadcastStream)...")
     display.start()
+    print("🚀 Starting processor (Processor)...")
     processor.start()
+    print("🚀 Starting receiver (ThreadedWebsocket)...")
     receiver.start()
+    print("✅ ========== ALL COMPONENTS STARTED ==========")
+    print("👀 Waiting for webcam frames...")
 
     exit_event = threading.Event()
     try:
