@@ -11,6 +11,22 @@ safetensors>=0.4
 regex>=2024.0
 huggingface_hub>=0.23
 
-# Optional, only needed for --voice
+# Prompt weighting and ("a", "b").blend(x, y), as the backend uses. Optional:
+# app.py falls back to diffusers' own encoder (and manual blending) without it.
+compel>=2.0
+
+# Reads the display geometry (NSScreen.visibleFrame) so the fullscreen window is
+# filled exactly. Falls back to AppleScript, which cannot see the menu bar height.
+pyobjc-framework-Cocoa>=9.0
+
+# Enumerates cameras by type so a USB one is preferred over the built-in one,
+# and a paired iPhone only used as a last resort.
+pyobjc-framework-AVFoundation>=9.0
+
+# Optional, only needed for --voice.
+# mlx-whisper runs large-v3-turbo on the GPU and is the default; faster-whisper
+# is the hosted backend's own stack, and its bundled Silero VAD is used to gate
+# silent chunks whichever transcriber is chosen, so install both.
 sounddevice>=0.4
 mlx-whisper>=0.4
+faster-whisper>=1.0
