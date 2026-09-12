@@ -1,0 +1,5 @@
+Files in this directory are vendored verbatim from
+https://github.com/ml-explore/mlx-examples/tree/main/stable_diffusion/stable_diffusion
+(c) Apple Inc., Apache License 2.0.
+
+See https://github.com/ml-explore/mlx-examples/blob/main/LICENSE for license terms.

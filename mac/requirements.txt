@@ -1,0 +1,16 @@
+torch>=2.3
+diffusers>=0.27
+transformers>=4.40
+accelerate>=0.30
+opencv-python>=4.9
+pillow>=10.0
+numpy>=1.26
+
+mlx>=0.20
+safetensors>=0.4
+regex>=2024.0
+huggingface_hub>=0.23
+
+# Optional, only needed for --voice
+sounddevice>=0.4
+mlx-whisper>=0.4
