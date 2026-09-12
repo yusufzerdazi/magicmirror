@@ -17,6 +17,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 import models
 
+
+def app_edge_styles():
+    import app
+    return app.EDGE_STYLES
+
 # waitKeyEx codes. macOS HighGUI reports arrows in the NSEvent function-key
 # range; the Linux/Qt values are accepted too so the same build works anywhere.
 KEY_UP = (63232, 82, 2490368, 65362, 0, 0x100000 | 82)
@@ -132,6 +137,9 @@ class ConfigPanel:
                   st.adjust_fade,
                   fmt=lambda v: v if isinstance(v, str) else f"{v:.2f}",
                   options=fade_steps),
+            Field("edges", lambda: st.edge_style, st.cycle_edges,
+                  hint="line drawing fed to the ControlNet models",
+                  options=list(app_edge_styles())),
             Field("framing", lambda: st.capture_fit, st.cycle_framing,
                   options=["wide", "stretch", "crop"]),
             Field("rotation", lambda: st.rotation,

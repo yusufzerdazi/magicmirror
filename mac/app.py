@@ -219,6 +219,99 @@ def warp_batch(pipe, encoder, rgbs, prompt, seed, device, strength, steps):
     return [np.asarray(o) for o in out]
 
 
+# Edge extraction for the ControlNet path. The camera is usually dim and low
+# contrast, so equalising first matters more than the operator chosen: without
+# it the line drawing comes out nearly blank and the model free-runs.
+EDGE_STYLES = ("sobel", "xdog", "canny")
+
+
+def _equalised_grey(rgb):
+    grey = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    return cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(grey)
+
+
+def sketch_from_frame(rgb, style="sobel"):
+    """Camera frame -> white-on-black line drawing, the control image."""
+    if style == "canny":
+        grey = cv2.GaussianBlur(_equalised_grey(rgb), (5, 5), 0)
+        median = np.median(grey)
+        lines = cv2.Canny(grey, int(max(0, 0.67 * median)),
+                          int(min(255, 1.33 * median)))
+    elif style == "xdog":
+        grey = _equalised_grey(rgb).astype(np.float32) / 255.0
+        narrow = cv2.GaussianBlur(grey, (0, 0), 1.0)
+        wide = cv2.GaussianBlur(grey, (0, 0), 1.6)
+        difference = 21.0 * narrow - 20.0 * wide
+        soft = np.clip(np.where(difference >= 0.02, 1.0,
+                                1.0 + np.tanh(8.0 * (difference - 0.02))), 0, 1)
+        lines = (255 - soft * 255).astype(np.uint8)
+    else:
+        grey = cv2.GaussianBlur(_equalised_grey(rgb), (5, 5), 0).astype(np.float32)
+        magnitude = np.hypot(cv2.Sobel(grey, cv2.CV_32F, 1, 0, ksize=3),
+                             cv2.Sobel(grey, cv2.CV_32F, 0, 1, ksize=3))
+        magnitude = magnitude / (magnitude.max() + 1e-6) * 255.0
+        lines = np.clip(magnitude * 1.6, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lines, cv2.COLOR_GRAY2RGB)
+
+
+def warp_batch_control(pipe, encoder, rgbs, prompt, seed, device, scale, style):
+    """One-step generation conditioned on the camera as a line drawing."""
+    embeds, _ = encoder.encode(prompt, len(rgbs))
+    controls = [Image.fromarray(sketch_from_frame(r, style)) for r in rgbs]
+    generators = [torch.Generator(device=device).manual_seed(seed) for _ in rgbs]
+    out = pipe(
+        prompt_embeds=embeds,
+        image=controls,
+        width=SIZE,
+        height=SIZE,
+        num_inference_steps=1,
+        guidance_scale=0.0,
+        controlnet_conditioning_scale=float(scale),
+        generator=generators,
+    ).images
+    return [np.asarray(o) for o in out]
+
+
+def warp_batch_one_step(pipe, encoder, rgbs, prompt, seed, device, blend):
+    """Single UNet evaluation at the highest timestep, for one-step models.
+
+    A model distilled to map noise to an image in one shot only has a valid
+    prediction at that one timestep. diffusers' img2img has to *start* below it
+    to keep any of the input, so the UNet is always asked for a prediction it
+    was never trained to make and the result is under-denoised mush — visibly
+    so, and the same thing happens in plain text-to-image the moment a second
+    step is taken.
+
+    Instead the image latent is blended with noise directly and denoised once at
+    that timestep. `blend` is how much of the image to keep; the schedule's own
+    value is about 0.07, and much above 0.3 leaves the input too far from
+    anything the model saw in training and the picture falls apart.
+    """
+    unet, vae = pipe.unet, pipe.vae
+    alphas = pipe.scheduler.alphas_cumprod.to(device)
+    timestep = pipe.scheduler.config.num_train_timesteps - 1
+    sqrt_alpha = alphas[timestep].sqrt()
+    sqrt_one_minus = (1 - alphas[timestep]).sqrt()
+
+    embeds, _ = encoder.encode(prompt, len(rgbs))
+    # encode() expands a single embedding across the batch with stride 0, which
+    # some MPS kernels reject when the UNet is called directly rather than
+    # through a pipeline.
+    embeds = embeds.contiguous()
+    batch = np.stack(rgbs)
+    x = torch.from_numpy(batch).to(device, unet.dtype).permute(0, 3, 1, 2) / 127.5 - 1.0
+    with torch.no_grad():
+        latents = vae.encode(x).latents
+        generator = torch.Generator(device=device).manual_seed(seed)
+        noise = torch.randn(latents.shape, generator=generator, device=device,
+                            dtype=latents.dtype)
+        noisy = blend * latents + (1 - blend ** 2) ** 0.5 * noise
+        predicted = unet(noisy, timestep, encoder_hidden_states=embeds).sample
+        decoded = vae.decode((noisy - sqrt_one_minus * predicted) / sqrt_alpha).sample
+    frames = ((decoded.permute(0, 2, 3, 1).float().clamp(-1, 1) + 1) * 127.5)
+    return list(frames.cpu().numpy().astype(np.uint8))
+
+
 def warmup(pipe, encoder, prompt, seed, device, strength, steps, batch_size):
     dummy = [np.zeros((SIZE, SIZE, 3), dtype=np.uint8) for _ in range(batch_size)]
     for i in range(2):
@@ -267,8 +360,16 @@ class InferenceWorker:
 
             t0 = time.time()
             try:
-                warped = warp_batch(pipe, encoder, rgbs, prompt, seed,
-                                    self.device, settings.strength, settings.steps)
+                if _spec.control_repo:
+                    warped = warp_batch_control(pipe, encoder, rgbs, prompt, seed,
+                                                self.device, settings.strength,
+                                                settings.edge_style)
+                elif _spec.one_step:
+                    warped = warp_batch_one_step(pipe, encoder, rgbs, prompt, seed,
+                                                 self.device, settings.strength)
+                else:
+                    warped = warp_batch(pipe, encoder, rgbs, prompt, seed,
+                                        self.device, settings.strength, settings.steps)
             except Exception as e:
                 print(f"inference error: {e}", flush=True)
                 time.sleep(0.2)
@@ -427,6 +528,7 @@ class LiveSettings:
         self.seed = args.seed
         self.rotation = args.rotation
         self.capture_fit = args.capture_fit
+        self.edge_style = EDGE_STYLES[0]
         self.tint_on = not args.no_tint
         self.background_on = args.background == "circles"
         self.fade_step = None
@@ -448,6 +550,10 @@ class LiveSettings:
         self.capture_fit = order[(order.index(self.capture_fit) + delta) % len(order)]
         if self.on_framing:
             self.on_framing(self.capture_fit)
+
+    def cycle_edges(self, delta):
+        index = (EDGE_STYLES.index(self.edge_style) + delta) % len(EDGE_STYLES)
+        self.edge_style = EDGE_STYLES[index]
 
     def toggle_tint(self):
         self.tint_on = not self.tint_on

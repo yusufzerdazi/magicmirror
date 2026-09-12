@@ -19,7 +19,8 @@ from diffusers.utils.logging import disable_progress_bar
 
 
 class ModelSpec:
-    def __init__(self, name, repo, vae, steps, strength, size, note, loader=None):
+    def __init__(self, name, repo, vae, steps, strength, size, note, loader=None,
+                 one_step=False, control_repo=None):
         self.name = name
         self.repo = repo
         self.vae = vae
@@ -27,7 +28,15 @@ class ModelSpec:
         self.strength = strength
         self.size = size          # native resolution
         self.note = note
-        self.loader = loader or _load_standard
+        # A one-step distilled model has no usable intermediate timesteps, so it
+        # cannot go through the ordinary img2img schedule at all; see
+        # app.warp_batch_one_step.
+        self.one_step = one_step
+        # A ControlNet checkpoint that takes the camera in as a line drawing.
+        # This is how a one-step model can act as a mirror at all: the picture
+        # is conditioning on a text-to-image pass, not a partly-denoised init.
+        self.control_repo = control_repo
+        self.loader = loader or (_load_controlnet if control_repo else _load_standard)
 
     def load(self, device, dtype):
         return self.loader(self, device, dtype)
@@ -49,6 +58,16 @@ def _load_standard(spec, device, dtype):
     if spec.name.startswith("sdxs") or spec.name == "sd-turbo":
         kwargs["safety_checker"] = None
     pipe = AutoPipelineForImage2Image.from_pretrained(spec.repo, **kwargs)
+    return _finish(pipe, spec, device, dtype)
+
+
+def _load_controlnet(spec, device, dtype):
+    """Base model plus its ControlNet, as the SDXS sketch demo wires it up."""
+    from diffusers import ControlNetModel, StableDiffusionControlNetPipeline
+
+    controlnet = ControlNetModel.from_pretrained(spec.control_repo, torch_dtype=dtype)
+    pipe = StableDiffusionControlNetPipeline.from_pretrained(
+        spec.repo, controlnet=controlnet, torch_dtype=dtype, safety_checker=None)
     return _finish(pipe, spec, device, dtype)
 
 
@@ -82,11 +101,11 @@ MODELS = {
         steps=2, strength=0.65, size=512,
         note="SD2.1 turbo, a third the size of SDXL and natively 512"),
     "sdxs-512": ModelSpec(
-        "sdxs-512", "IDKiro/sdxs-512-dreamshaper", "madebyollin/taesd",
-        steps=2, strength=0.6, size=512,
-        note="0.32B one-step SD1.5, by far the fastest here but the img2img "
-             "output needs work; it cannot run at 1 step because diffusers "
-             "requires int(steps * strength) >= 1"),
+        "sdxs-512", "IDKiro/sdxs-512-dreamshaper", None,
+        steps=1, strength=1.0, size=512, one_step=True,
+        control_repo="IDKiro/sdxs-512-dreamshaper-sketch",
+        note="one-step SD1.5 driven through its sketch ControlNet; the camera "
+             "goes in as a line drawing. strength is the ControlNet scale."),
     "sdxl-lightning": ModelSpec(
         "sdxl-lightning", None, "madebyollin/taesdxl",
         steps=8, strength=0.375, size=1024,

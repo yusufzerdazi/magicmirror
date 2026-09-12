@@ -44,6 +44,7 @@ python3 -m venv .venv
 | | |
 | --- | --- |
 | model | `sdxl-turbo`, `sd-turbo`, `sdxs-512`, `sdxl-lightning` — press return to load |
+| edges | line drawing fed to the ControlNet models: `sobel`, `xdog`, `canny` |
 | steps, strength | per-model defaults; changing the model resets them |
 | seed, blend | as the keys do |
 | cross-fade | `auto` or a fixed step |
@@ -118,25 +119,56 @@ out of compel's `("a", "b").blend(0.60, 0.40)`.
 | --- | --- | --- | --- |
 | `sdxl-turbo` (default) | 2.57B | **8.0 fps** | what the `local-run` backend uses; best looking of the three |
 | `sd-turbo` | 0.87B | **10.2 fps** | SD2.1, natively 512, a third the size; slightly flatter output |
-| `sdxs-512` | 0.32B | **18.7 fps** | by far the fastest; output needs work, see below |
+| `sdxs-512` | 0.32B | **19 fps** | fastest, and tracks properly via its sketch ControlNet — see below |
 | `sdxl-lightning` | 2.57B | **3.2 fps** at its 8 steps | `mischief 3.0`'s model; needs SDXL base (~7GB) on top of the Lightning UNet |
 
 Measured on this machine at the app's own settings. Lightning is a real
 quality/frame-rate trade rather than a free win: 8 steps costs 8.0 fps -> 3.2.
 
-### sdxs-512
+### sdxs-512, and how it became the fastest mirror here
 
-`IDKiro/sdxs-512-dreamshaper` is a 0.32B one-step distilled SD1.5 and runs at
-**18.7 fps** here, more than twice the default model. Straight out of the box
-its img2img output is noise rather than a picture, so it is kept as an option to
-tune rather than a recommendation — the panel's steps and strength are the
-things to push at. Two constraints to know while doing that:
+`IDKiro/sdxs-512-dreamshaper` is a 0.32B one-step distilled SD1.5. Pointed at
+the ordinary img2img path it produced grey mush, and the reason is structural:
 
-* It cannot run at one step. diffusers derives the img2img timestep range as
-  `int(steps * strength)` and refuses a zero-length schedule, so `steps` must be
-  at least 2 and `steps * strength >= 1`.
-* Its distillation expects a particular scheduler; the default one the
-  checkpoint ships with may not be what the published 1-step results used.
+**its UNet is only valid at one timestep.** Plain text-to-image collapses the
+moment a second step is taken, with no img2img involved at all:
+
+| txt2img steps | timesteps | output |
+| --- | --- | --- |
+| 1 | `[999]` | clean, std 63.5 |
+| 2 | `[999, 499]` | mush, std 18.6 |
+| 4 | `[999, 749, 499, 249]` | worse, std 13.7 |
+
+Distillation maps noise to an image in one shot and leaves nothing usable below
+that top timestep. diffusers' img2img has to *start* below it — that is how it
+keeps any of the input — so the UNet is always asked for a prediction it never
+learned, and no combination of steps and strength avoids that. It is not a
+misconfiguration and it is not tunable.
+
+**The model conditions on images through a ControlNet instead**, which is how
+the project's own `demo_sketch.py` uses it: one step, guidance 0, and the image
+supplied as a *line drawing* to `IDKiro/sdxs-512-dreamshaper-sketch` rather than
+as a partly-noised init. That is a text-to-image pass with structural
+conditioning, so it only ever needs the one timestep the model has.
+
+So `warp_batch_control` turns each camera frame into a white-on-black line
+drawing and runs exactly that. The result tracks pose, framing and scale
+properly — and it is the fastest model here:
+
+| | batch of 4 at 512 | conditioning |
+| --- | --- | --- |
+| `sdxs-512` | **19 fps** | sketch ControlNet |
+| `sd-turbo` | 10.2 fps | img2img |
+| `sdxl-turbo` | 8.3 fps | img2img |
+
+The camera is usually dim and low contrast, and that matters more than the edge
+operator: without equalising first the line drawing comes out nearly blank and
+the model free-runs, which was the other half of why early attempts looked
+untethered. Every frame is CLAHE-equalised before edges are taken. The `edges`
+row in the config panel switches between `sobel` (default, densest and the most
+faithful), `xdog` (cleaner, more stylised lines) and `canny` (sparsest, lets the
+model invent more). For ControlNet models `strength` is the
+`controlnet_conditioning_scale` — how hard the structure is imposed.
 
 Worth knowing for later: the fastest published real-time camera img2img on
 Apple Silicon is [SDXS-512 converted to CoreML](https://arxiv.org/abs/2605.16259),
