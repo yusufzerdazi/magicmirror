@@ -118,9 +118,9 @@ out of compel's `("a", "b").blend(0.60, 0.40)`.
 | | UNet | batch of 4 at 512 | notes |
 | --- | --- | --- | --- |
 | `sdxl-turbo` (default) | 2.57B | **8.0 fps** | what the `local-run` backend uses; best looking of the three |
-| `sd-turbo` | 0.87B | **10.2 fps** | SD2.1, natively 512, a third the size; slightly flatter output |
+| `sd-turbo` | 0.87B | **10.2 fps** | SD2.1, natively 512. Implemented but **not offered** — see below |
 | `sdxs-512` | 0.32B | **19 fps** | fastest, and tracks properly via its sketch ControlNet — see below |
-| `sdxl-lightning` | 2.57B | **3.2 fps** at its 8 steps | `mischief 3.0`'s model; needs SDXL base (~7GB) on top of the Lightning UNet |
+| `sdxl-lightning` | 2.57B | **3.2 fps** at its 8 steps | `mischief 3.0`'s model. Implemented but **not offered** — see below |
 
 Measured on this machine at the app's own settings. Lightning is a real
 quality/frame-rate trade rather than a free win: 8 steps costs 8.0 fps -> 3.2.
@@ -164,11 +164,56 @@ properly — and it is the fastest model here:
 The camera is usually dim and low contrast, and that matters more than the edge
 operator: without equalising first the line drawing comes out nearly blank and
 the model free-runs, which was the other half of why early attempts looked
-untethered. Every frame is CLAHE-equalised before edges are taken. The `edges`
-row in the config panel switches between `sobel` (default, densest and the most
-faithful), `xdog` (cleaner, more stylised lines) and `canny` (sparsest, lets the
-model invent more). For ControlNet models `strength` is the
-`controlnet_conditioning_scale` — how hard the structure is imposed.
+untethered. Every frame is CLAHE-equalised before edges are taken. For
+ControlNet models `strength` is the `controlnet_conditioning_scale` — how hard
+the structure is imposed.
+
+The `edges` row in the config panel chooses how the line drawing is made:
+
+| | | cost |
+| --- | --- | --- |
+| `depth` (default) | subject outline from estimated depth, detail from the colour image inside it | 14.1 fps |
+| `depth-raw` | the depth map itself, no edge extraction | 14.7 fps |
+| `sobel` | gradient edges, equalised | 19.1 fps |
+
+`depth-raw` is worth knowing about: handing the ControlNet the dense grey depth
+field is nothing like the line drawings it was trained on, and it works anyway.
+It reads the field as a soft shape prior and returns smoother, better
+proportioned forms than lines do — at the cost of the facial detail the lines
+carry, since depth cannot see a face.
+
+### Styles that are implemented but not offered
+
+`app.DISABLED_EDGE_STYLES` lists the rest. They all still work; adding one back
+to `EDGE_STYLES` puts it in the panel.
+
+| | | cost |
+| --- | --- | --- |
+| `hed` | learned soft boundaries; the best at faces of anything tried | 13.2 fps |
+| `pidinet` | learned, crisper than HED | 11.9 fps |
+| `lineart` | learned, sparse clean strokes; the model invents more | 11.0 fps |
+| `lineart-anime` | learned; renders dark clothing as dithering that leaks into the output | 12 fps |
+| `xdog` | stylised lines | 19 fps |
+| `canny` | sparsest | 19 fps |
+
+The learned three come from the ControlNet preprocessor family via
+`controlnet_aux`, and are what this ControlNet was built to be fed: a gradient
+operator finds noise where a face is, and these find the face. `hed` in
+particular places eyes and muzzle on the real ones more convincingly than the
+depth styles do. They are held back only because they cost about 6 fps against
+`sobel` and add a dependency on the annotator weights.
+
+The `depth` styles run [Depth Anything V2 Small](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf)
+(25M parameters, ~20ms a frame) over the camera. Depth separates subject from
+background cleanly in a dim room, which is exactly where colour edges give up —
+but used alone it draws every fold as a contour ring and reads as topography
+rather than a figure. So the outline comes from depth and the detail from the
+colour image within it. The whole batch goes through the estimator in one pass;
+four separate calls cost 117ms against 67ms batched. If the estimator will not
+load it falls back to `sobel` rather than stopping the show.
+
+No sensor is needed for any of this — see the Kinect section for using a real
+depth camera instead.
 
 Worth knowing for later: the fastest published real-time camera img2img on
 Apple Silicon is [SDXS-512 converted to CoreML](https://arxiv.org/abs/2605.16259),

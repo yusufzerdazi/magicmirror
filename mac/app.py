@@ -25,6 +25,7 @@ from PIL import Image
 from diffusers.utils.logging import disable_progress_bar
 
 import config_panel
+import depth as depth_module
 import devices
 import models as model_registry
 import overlay
@@ -222,7 +223,61 @@ def warp_batch(pipe, encoder, rgbs, prompt, seed, device, strength, steps):
 # Edge extraction for the ControlNet path. The camera is usually dim and low
 # contrast, so equalising first matters more than the operator chosen: without
 # it the line drawing comes out nearly blank and the model free-runs.
-EDGE_STYLES = ("sobel", "xdog", "canny")
+# Offered in the config panel, first one is the default. The rest are still
+# implemented below and switch on by being added back here — `hed` and `pidinet`
+# in particular read faces better than anything else tried, at about 6 fps.
+EDGE_STYLES = ("depth", "depth-raw", "sobel")
+DISABLED_EDGE_STYLES = ("hed", "pidinet", "lineart", "lineart-anime",
+                        "xdog", "canny")
+
+# Learned boundary detectors, from the ControlNet preprocessor family. They find
+# the structure of a face where a gradient operator finds only noise, which is
+# what this ControlNet wants to be given.
+LEARNED_EDGES = {
+    "hed": "HEDdetector",
+    "pidinet": "PidiNetDetector",
+    "lineart": "LineartDetector",
+    "lineart-anime": "LineartAnimeDetector",
+}
+_DETECTORS = {}
+
+
+def learned_detector(style, device):
+    """Lazily build one of the controlnet_aux detectors."""
+    if style not in _DETECTORS:
+        import controlnet_aux
+
+        cls = getattr(controlnet_aux, LEARNED_EDGES[style])
+        _DETECTORS[style] = cls.from_pretrained("lllyasviel/Annotators").to(device)
+    return _DETECTORS[style]
+
+# Estimator for the "depth" style, built on first use.
+_MONO_DEPTH = []
+
+
+def mono_depth(device):
+    if not _MONO_DEPTH:
+        _MONO_DEPTH.append(depth_module.MonoDepth(device))
+    return _MONO_DEPTH[0]
+
+
+def sketch_from_depth_and_frame(rgb, relative, keep=0.55, detail=1.0):
+    """Subject outline from depth, detail from the colour image inside it.
+
+    Depth alone draws every fold as a contour ring and reads as topography;
+    colour edges alone lose the subject in a dark room and cover the background
+    in clutter. Taking the outline from one and the detail from the other gives
+    a clean figure with a face in it.
+    """
+    thresh = np.quantile(relative, 1.0 - keep)      # keep the nearest fraction
+    mask = ((relative >= thresh) * 255).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    outline = cv2.dilate(cv2.Canny(mask, 50, 150), np.ones((3, 3), np.uint8))
+    edges = sketch_from_frame(rgb, "sobel")[:, :, 0].astype(np.float32)
+    edges[cv2.erode(mask, np.ones((5, 5), np.uint8)) == 0] = 0
+    lines = np.clip(outline.astype(np.float32) + edges * detail, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lines, cv2.COLOR_GRAY2RGB)
 
 
 def _equalised_grey(rgb):
@@ -254,11 +309,53 @@ def sketch_from_frame(rgb, style="sobel"):
     return cv2.cvtColor(lines, cv2.COLOR_GRAY2RGB)
 
 
-def warp_batch_control(pipe, encoder, rgbs, prompt, seed, device, scale, style):
-    """One-step generation conditioned on the camera as a line drawing."""
-    embeds, _ = encoder.encode(prompt, len(rgbs))
-    controls = [Image.fromarray(sketch_from_frame(r, style)) for r in rgbs]
-    generators = [torch.Generator(device=device).manual_seed(seed) for _ in rgbs]
+def warp_batch_control(pipe, encoder, frames, prompt, seed, device, scale,
+                       style="sobel"):
+    """One-step generation conditioned on the camera as a line drawing.
+
+    `style=None` means the frames are already line drawings — what the depth
+    source produces — and should be passed through untouched.
+    """
+    embeds, _ = encoder.encode(prompt, len(frames))
+    if style is None:
+        sketches = list(frames)                     # already line drawings
+    elif style in LEARNED_EDGES:
+        try:
+            detector = learned_detector(style, device)
+            sketches = []
+            for frame in frames:
+                drawn = detector(Image.fromarray(frame), detect_resolution=SIZE,
+                                 image_resolution=SIZE).convert("L")
+                sketches.append(cv2.cvtColor(np.asarray(drawn), cv2.COLOR_GRAY2RGB))
+        except Exception as e:
+            print(f"{style} unavailable ({e}); falling back to edges", flush=True)
+            _DETECTORS.pop(style, None)
+            style = "sobel"
+            sketches = [sketch_from_frame(f, style) for f in frames]
+    elif style in ("depth", "depth-raw"):
+        try:
+            planes = mono_depth(device).relative(frames)
+            if style == "depth-raw":
+                # The depth map itself, no edge extraction. A sketch ControlNet
+                # has never seen a dense grey field, but it reads it as a soft
+                # shape prior and returns smoother, better-proportioned forms
+                # than lines do — at the cost of the facial detail lines carry.
+                sketches = [cv2.cvtColor((np.clip(d, 0, 1) * 255).astype(np.uint8),
+                                         cv2.COLOR_GRAY2RGB) for d in planes]
+            else:
+                sketches = [sketch_from_depth_and_frame(f, d)
+                            for f, d in zip(frames, planes)]
+        except Exception as e:
+            # Never let the estimator take the mirror down mid-show.
+            print(f"depth estimation unavailable ({e}); falling back to edges",
+                  flush=True)
+            _MONO_DEPTH.clear()
+            style = "sobel"
+            sketches = [sketch_from_frame(f, style) for f in frames]
+    else:
+        sketches = [sketch_from_frame(f, style) for f in frames]
+    controls = [Image.fromarray(s) for s in sketches]
+    generators = [torch.Generator(device=device).manual_seed(seed) for _ in frames]
     out = pipe(
         prompt_embeds=embeds,
         image=controls,
@@ -322,9 +419,12 @@ def warmup(pipe, encoder, prompt, seed, device, strength, steps, batch_size):
 
 class InferenceWorker:
     def __init__(self, manager, capture, prompt_state, batch_size, settings,
-                 device, output_queue, tint=None):
+                 device, output_queue, tint=None, depth_source=None):
         self.manager = manager
         self.capture = capture
+        # When present, the ControlNet's line drawing comes from depth instead
+        # of the colour camera.
+        self.depth_source = depth_source
         self.prompt_state = prompt_state
         self.batch_size = batch_size
         # Live settings, edited from the config panel.
@@ -349,21 +449,24 @@ class InferenceWorker:
                 time.sleep(0.05)
                 continue
 
-            rgbs = self.capture.latest_spaced(self.batch_size, self.last_batch_seconds)
+            use_depth = self.depth_source is not None and _spec.control_repo
+            source = self.depth_source if use_depth else self.capture
+            rgbs = source.latest_spaced(self.batch_size, self.last_batch_seconds)
             if rgbs is None:
                 time.sleep(0.005)
                 continue
 
-            if self.tint is not None and settings.tint_on:
+            if self.tint is not None and settings.tint_on and not use_depth:
                 now = time.time()
                 rgbs = [self.tint.apply(r, now) for r in rgbs]
 
             t0 = time.time()
             try:
                 if _spec.control_repo:
-                    warped = warp_batch_control(pipe, encoder, rgbs, prompt, seed,
-                                                self.device, settings.strength,
-                                                settings.edge_style)
+                    warped = warp_batch_control(
+                        pipe, encoder, rgbs, prompt, seed, self.device,
+                        settings.strength,
+                        None if use_depth else settings.edge_style)
                 elif _spec.one_step:
                     warped = warp_batch_one_step(pipe, encoder, rgbs, prompt, seed,
                                                  self.device, settings.strength)
@@ -529,6 +632,7 @@ class LiveSettings:
         self.rotation = args.rotation
         self.capture_fit = args.capture_fit
         self.edge_style = EDGE_STYLES[0]
+        self.rotate_minutes = args.rotate_models
         self.tint_on = not args.no_tint
         self.background_on = args.background == "circles"
         self.fade_step = None
@@ -536,6 +640,33 @@ class LiveSettings:
         self.pending_model = None
         self.on_seed = None
         self.on_framing = None
+
+    def switch_model(self, name):
+        """Start loading `name` and take its own steps and strength with it."""
+        spec = model_registry.MODELS[name]
+        if not self.manager.switch(name):
+            return False
+        self.steps = spec.steps
+        self.strength = spec.strength
+        self.pending_model = None
+        return True
+
+    def next_model(self):
+        """The model after the current one, in the offered order."""
+        names = model_registry.AVAILABLE
+        if not names:
+            return None
+        try:
+            index = names.index(self.manager.name)
+        except ValueError:
+            return names[0]     # running something not in the offered list
+        return names[(index + 1) % len(names)]
+
+    def adjust_rotation(self, delta):
+        choices = [0, 5, 10, 15, 30, 45, 60]
+        index = (choices.index(self.rotate_minutes)
+                 if self.rotate_minutes in choices else 0)
+        self.rotate_minutes = choices[min(max(index + delta, 0), len(choices) - 1)]
 
     def set_seed(self, value):
         self.seed = int(value)
@@ -648,16 +779,14 @@ class CommandReader:
                 if self.on_transcript is not None:
                     self.on_transcript(rest)
             elif head_lower in ("model", "models") and self.settings is not None:
-                names = list(model_registry.MODELS)
+                names = list(model_registry.AVAILABLE)
                 if not rest or rest not in names:
                     current = self.settings.manager.name
                     print(f"model: {current} — available: {', '.join(names)}",
                           flush=True)
                 else:
                     spec = model_registry.MODELS[rest]
-                    if self.settings.manager.switch(rest):
-                        self.settings.steps = spec.steps
-                        self.settings.strength = spec.strength
+                    if self.settings.switch_model(rest):
                         print(f"loading {rest} ({spec.steps} steps, "
                               f"strength {spec.strength})...", flush=True)
                     else:
@@ -711,10 +840,17 @@ def draw_prompt_editor(stage_bgr, label, buffer):
                 max(1, int(2 * scale)), cv2.LINE_AA)
 
 
-def draw_preview(stage_bgr, capture, rotation, prompt_state, fps, queued):
-    """The 'h' overlay: the frontend's hidden device/rotation/status controls."""
+def draw_preview(stage_bgr, capture, rotation, prompt_state, fps, queued,
+                 depth_source=None):
+    """The 'h' overlay: the frontend's hidden device/rotation/status controls.
+
+    With depth running this shows the line drawing the model is actually being
+    given, which is the thing worth looking at when framing the sensor.
+    """
     H, W = stage_bgr.shape[:2]
-    raw = capture.raw_frame()
+    raw = depth_source.preview() if depth_source is not None else None
+    if raw is None and capture is not None:
+        raw = capture.raw_frame()
     if raw is not None:
         thumb_w = max(120, W // 8)
         thumb_h = int(round(thumb_w * raw.shape[0] / raw.shape[1]))
@@ -831,13 +967,29 @@ def build_parser():
     parser.add_argument("--camera", default="auto", metavar="WHICH",
                         help="auto (default) prefers a USB camera, then the "
                              "built-in one, then a paired iPhone; or name a kind "
-                             "(usb/builtin/iphone) or an index")
+                             "(usb/builtin/iphone), an index, or 'none' to run "
+                             "from depth alone")
+    parser.add_argument("--depth", choices=depth_module.BACKENDS, default="off",
+                        help="use a Kinect's depth as the ControlNet line "
+                             "drawing instead of the colour camera. 'server' "
+                             "reads from the privileged helper (sudo python "
+                             "depth.py --serve), which is what to use on macOS; "
+                             "'kinect'/'kinect2' open the device in-process and "
+                             "need the app itself to be root")
+    parser.add_argument("--depth-near", type=int, default=depth_module.DEFAULT_NEAR_MM,
+                        metavar="MM", help="near edge of the working volume")
+    parser.add_argument("--depth-far", type=int, default=depth_module.DEFAULT_FAR_MM,
+                        metavar="MM", help="far edge of the working volume")
     parser.add_argument("--mic", default="auto", metavar="WHICH",
                         help="same choice for the microphone")
     parser.add_argument("--list-devices", action="store_true",
                         help="print the cameras and microphones found, then exit")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--model", choices=tuple(model_registry.MODELS),
+    parser.add_argument("--rotate-models", type=int, default=30, metavar="MINUTES",
+                        help="cycle through the models on this interval; 0 is "
+                             "off. The timer restarts whenever the model is "
+                             "changed by hand")
+    parser.add_argument("--model", choices=model_registry.AVAILABLE,
                         default=model_registry.DEFAULT_MODEL,
                         help="diffusion model; switchable at runtime in the "
                              "config panel (c)")
@@ -947,12 +1099,14 @@ def main():
                   + (f"cv2 index {index}: {name} ({why})" if index is not None else why))
         return
 
-    camera_index, camera_name, camera_kind, camera_why = devices.pick_camera(args.camera)
-    if camera_index is None:
-        raise SystemExit(f"no camera to use — {camera_why}. "
-                         f"Found: {devices.describe(devices.list_cameras())}")
-    print(f"camera: [{camera_index}] {camera_name} ({camera_kind}, {camera_why})",
-          flush=True)
+    camera_index = None
+    if str(args.camera).lower() != "none":
+        camera_index, camera_name, camera_kind, camera_why = devices.pick_camera(args.camera)
+        if camera_index is None:
+            raise SystemExit(f"no camera to use — {camera_why}. "
+                             f"Found: {devices.describe(devices.list_cameras())}")
+        print(f"camera: [{camera_index}] {camera_name} ({camera_kind}, {camera_why})",
+              flush=True)
 
     screen_size = args.display_size or detect_screen_size()
     # 'fill' resolves to the display's own ratio, so the capture crop and the
@@ -980,14 +1134,29 @@ def main():
     warmup(pipe, encoder, prompt_state.composed(), settings.seed, device,
            settings.strength, settings.steps, args.batch)
 
-    capture = WebcamCapture(camera_index, args.capture_fit, stage_aspect)
-    capture.start()
-    settings.on_framing = lambda fit: setattr(capture, "fit", fit)
+    depth_source = None
+    if args.depth != "off":
+        if args.depth == "server":
+            depth_source = depth_module.SocketDepthSource(SIZE)
+        else:
+            depth_source = depth_module.DepthSource(
+                args.depth, SIZE, stage_aspect, args.depth_near, args.depth_far)
+        if not depth_source.try_start():
+            depth_source = None
+
+    capture = None
+    if camera_index is not None:
+        capture = WebcamCapture(camera_index, args.capture_fit, stage_aspect)
+        capture.start()
+        settings.on_framing = lambda fit: setattr(capture, "fit", fit)
+    elif depth_source is None:
+        raise SystemExit("--camera none needs a working --depth source")
 
     output_queue = queue.Queue(maxsize=MAX_BUFFER_SIZE)
     worker = InferenceWorker(
         manager=manager,
         capture=capture,
+        depth_source=depth_source,
         prompt_state=prompt_state,
         batch_size=args.batch,
         settings=settings,
@@ -1075,6 +1244,8 @@ def main():
     background = overlay.MorphingCircles() if args.background == "circles" else None
 
     show_preview = False
+    last_rotation = time.time()
+    last_seen_model = manager.name
     editing = None  # (label, buffer) while typing a prompt in the window
     canvas = None
     last_tick = time.time()
@@ -1094,6 +1265,18 @@ def main():
         dt = min(max(now - last_tick, 1e-4), 0.25)
         last_tick = now
 
+        # Any change of model — by hand or on the timer — restarts the clock,
+        # so a manual pick gets its full interval before being moved on.
+        if manager.name != last_seen_model:
+            last_seen_model = manager.name
+            last_rotation = now
+        if settings.rotate_minutes and not manager.loading \
+                and now - last_rotation >= settings.rotate_minutes * 60:
+            upcoming = settings.next_model()
+            if upcoming and settings.switch_model(upcoming):
+                print(f"auto-switch: loading {upcoming}", flush=True)
+            last_rotation = now
+
         screen_w, screen_h = screen_size
         if canvas is None or canvas.shape[:2] != (screen_h, screen_w):
             canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
@@ -1110,8 +1293,11 @@ def main():
         frame = stream.tick(dt)
         if frame is None:
             # Frontend behaviour: the raw camera shows through until the first
-            # warped frame lands.
-            raw = capture.raw_frame()
+            # warped frame lands. With no colour camera, show what the model is
+            # being given instead.
+            raw = capture.raw_frame() if capture is not None else None
+            if raw is None and depth_source is not None:
+                raw = depth_source.preview()
             frame = raw if raw is not None else np.zeros((SIZE, SIZE, 3), dtype=np.uint8)
 
         stage = fit_frame_to_stage(frame, stage_w, stage_h, settings.capture_fit)
@@ -1132,7 +1318,7 @@ def main():
             coin.draw(canvas, now, rect=(sx, sy, stage_w, stage_h))
         if show_preview:
             draw_preview(canvas, capture, settings.rotation, prompt_state, fps,
-                         len(stream.pending))
+                         len(stream.pending), depth_source)
         if editing is not None:
             draw_prompt_editor(canvas, editing[0], editing[1])
         panel.draw(canvas)
@@ -1225,7 +1411,10 @@ def main():
     if voice is not None:
         voice.close()
     worker.close()
-    capture.close()
+    if depth_source is not None:
+        depth_source.close()
+    if capture is not None:
+        capture.close()
     cv2.destroyAllWindows()
 
 

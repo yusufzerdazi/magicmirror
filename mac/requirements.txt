@@ -15,6 +15,9 @@ huggingface_hub>=0.23
 # app.py falls back to diffusers' own encoder (and manual blending) without it.
 compel>=2.0
 
+# Learned boundary detectors (hed/pidinet/lineart) for the ControlNet models.
+controlnet_aux>=0.0.7
+
 # Reads the display geometry (NSScreen.visibleFrame) so the fullscreen window is
 # filled exactly. Falls back to AppleScript, which cannot see the menu bar height.
 pyobjc-framework-Cocoa>=9.0

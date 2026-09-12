@@ -97,7 +97,7 @@ class ConfigPanel:
     # -- fields --------------------------------------------------------------
     def _build(self):
         st = self.state
-        names = list(models.MODELS)
+        names = list(models.AVAILABLE)
 
         def cycle_model(delta):
             current = st.pending_model or st.manager.name
@@ -109,11 +109,7 @@ class ConfigPanel:
             if not target or target == st.manager.name:
                 st.pending_model = None
                 return "already loaded"
-            spec = models.MODELS[target]
-            if st.manager.switch(target):
-                st.steps = spec.steps
-                st.strength = spec.strength
-                st.pending_model = None
+            if st.switch_model(target):
                 return f"loading {target}"
             return "busy"
 
@@ -137,6 +133,11 @@ class ConfigPanel:
                   st.adjust_fade,
                   fmt=lambda v: v if isinstance(v, str) else f"{v:.2f}",
                   options=fade_steps),
+            Field("auto-switch", lambda: st.rotate_minutes,
+                  st.adjust_rotation,
+                  fmt=lambda v: "off" if not v else f"{v} min",
+                  hint="cycle through the models on this interval",
+                  options=[0, 5, 10, 15, 30, 45, 60]),
             Field("edges", lambda: st.edge_style, st.cycle_edges,
                   hint="line drawing fed to the ControlNet models",
                   options=list(app_edge_styles())),

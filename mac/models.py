@@ -113,6 +113,15 @@ MODELS = {
         loader=_load_sdxl_lightning),
 }
 
+# Implemented but not offered at runtime; still loadable from code by taking a
+# name back out of here. sd-turbo works well but sits between the other two
+# without being distinct enough to earn a slot; sdxl-lightning needs the whole
+# SDXL base checkpoint and runs at 3.2 fps against sdxs-512's 19.
+DISABLED_MODELS = ("sd-turbo", "sdxl-lightning")
+
+#: The models the config panel and --model offer, in rotation order.
+AVAILABLE = tuple(name for name in MODELS if name not in DISABLED_MODELS)
+
 DEFAULT_MODEL = "sdxl-turbo"
 
 
