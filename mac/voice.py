@@ -164,12 +164,16 @@ class VoiceListener:
     def __init__(self, on_transcript, backend="auto", model=None,
                  chunk_seconds=CHUNK_SECONDS, safety_checker=None,
                  playback=False, input_device=None, gate=True,
-                 compute_type=FASTER_COMPUTE_TYPE):
+                 compute_type=FASTER_COMPUTE_TYPE, mute_while=None):
         self.on_transcript = on_transcript
         self.backend = backend
         self.model = model
         self.chunk_seconds = chunk_seconds
         self.gate = gate
+        # Called before audio is kept. While the mirror is talking the
+        # microphone hears it, and without this it transcribes its own reply and
+        # answers itself.
+        self.mute_while = mute_while
         self._gate = None
         self.compute_type = compute_type
         self.safety_checker = safety_checker
@@ -211,6 +215,11 @@ class VoiceListener:
         def callback(indata, frames, time_info, status):
             if status:
                 print(f"voice input status: {status}", flush=True)
+            if self.mute_while is not None and self.mute_while():
+                with self._buffer_lock:      # drop our own voice entirely
+                    self._buffer = []
+                    self._buffer_samples = 0
+                return
             with self._buffer_lock:
                 self._buffer.append(indata[:, 0].copy())
                 self._buffer_samples += frames

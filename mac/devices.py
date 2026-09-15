@@ -7,6 +7,7 @@ on a desk. The same order applies to microphones.
 """
 
 # Best first.
+import subprocess
 import time
 
 PRIORITY = ("usb", "builtin", "continuity")
@@ -135,6 +136,41 @@ def list_microphones():
         name = device.get("name", f"input {index}")
         out.append((index, name, _classify_by_name(name)))
     return out
+
+
+def list_speakers():
+    """Return [(say_id, name, kind)] of audio outputs.
+
+    The ids come from `say -a '?'` and are what `say -a` wants. Passing a name
+    instead works but crashes on anything unrecognised, so ids it is.
+    """
+    try:
+        result = subprocess.run(["say", "-a", "?"], capture_output=True,
+                                text=True, timeout=5)
+    except Exception:
+        return []
+    out = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        head, _, name = line.partition(" ")
+        if not head.isdigit() or not name.strip():
+            continue
+        name = name.strip()
+        out.append((int(head), name, _classify_by_name(name)))
+    return out
+
+
+def pick_speaker(preference=None):
+    """(say id, name, kind, why) for the output to speak through."""
+    devices = list_speakers()
+    if not devices:
+        return None, "system default", "unknown", "could not enumerate outputs"
+    chosen, why = _choose(devices, preference)
+    if chosen is None:
+        return None, None, None, why
+    return chosen[0], chosen[1], chosen[2], why
 
 
 def _choose(devices, preference):

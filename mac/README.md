@@ -73,7 +73,7 @@ thing `mischief 3.0`'s `/reload_model` does.
 
 | key | |
 | --- | --- |
-| `q` | quit |
+| `q` or `esc` | quit |
 | `f` | toggle fullscreen |
 | `h` | show the camera preview and status (the frontend's hidden `H` panel) |
 | `r` | rotate 90° |
@@ -224,8 +224,8 @@ uses CoreML; it is all PyTorch MPS.
 
 ## Cameras and microphones
 
-Devices are chosen by kind, best first: **a USB camera or microphone, then the
-machine's built-in one, then a paired iPhone.** Continuity Camera is last on
+Devices are chosen by kind, best first: **a USB camera, microphone or speaker,
+then the machine's built-in one, then a paired iPhone.** Continuity Camera is last on
 purpose — an installation that silently starts filming a phone on a desk is a
 bad failure mode. Cameras are classified through AVFoundation
 (`isContinuityCamera`, plus the built-in/external device type).
@@ -255,8 +255,10 @@ enumeration order. Probing costs a second or two at startup and briefly opens
 each camera in turn, which will wake a paired iPhone even when it is not the one
 being chosen. `--camera <index>` skips probing entirely.
 
-Microphones need none of this: sounddevice reports names alongside its own
-indices.
+Microphones and speakers need none of this: sounddevice reports input names
+alongside its own indices, and `say -a '?'` lists the outputs with the ids `say`
+itself wants. Those ids are what get passed — giving `say -a` a name it does not
+recognise crashes it rather than falling back.
 
 ```sh
 .venv/bin/python app.py --list-devices    # what was found, and how each was classified
@@ -272,6 +274,41 @@ Selection happens at startup; plugging a USB camera in later needs a restart.
 them, keeps only Whisper segments with `avg_logprob > -1`, drops repetitive
 output, runs the text through moderation, and puts what survives on screen for 5
 seconds (`SCROLL_DURATION`), scrolling along the same two wavy paths.
+
+Every line **flows into the cat**. Each takes its own route in from off screen
+and ends at the coin, so the mirror reads as listening to the room rather than
+as text being scrolled past it. The route is generated from the line itself, so
+it is stable for that line's life and no two are alike: the approach direction,
+the number of waves and the wobble all vary. That wobble tapers to nothing as
+the line nears the coin, so it settles in rather than thrashing about on
+arrival.
+
+The curve is a Catmull-Rom spline through its waypoints — building each wave as
+its own bezier instead leaves the tangent reversing at every joint, and the text
+visibly scallops along a row of half-circles rather than flowing.
+
+Lines are dealt into four lanes, and a lane is a *sector of approach* rather
+than a height, so lines converge from different directions instead of stacking.
+Alternate lanes take opposite sides, and every approach stays within
+`PATH_MAX_ELEVATION` (45 degrees) of horizontal — the coin sits near the bottom
+of the frame, so a steeper line has almost no screen to cross and arrives before
+it can be read.
+
+The lane comes from a hash of the line rather than from its arrival time. It was
+originally quantised from the timestamp into 2.5s buckets, which aliased exactly
+onto the four lanes at the ~10s cadence transcripts actually arrive on, so every
+line drew the same lane and they all came in from the same side. Glyphs take the path's tangent, and on a line
+running right to left they are laid down in reverse and turned through half a
+turn, which keeps the text the right way up and still reading forwards.
+
+Each line is tinted white, coin-blue or coin-pink. It fades up as it enters and
+dissolves again as it reaches the coin, so text disappears into the cat rather
+than sliding under it.
+
+Glyphs are drawn and rotated at three times their final size and then
+area-averaged down; rotating at the display size leaves the diagonals ragged.
+The synthetic bold stroke is gone too — Sigmar is heavy enough without it, and
+the stroke was only thickening the edges.
 
 The text is drawn over the whole screen rather than inside the picture, so a
 transcript sweeps in across the background before it crosses the square. Both
@@ -315,6 +352,51 @@ build only catches this when the invention happens to be repetitive.
 Every chunk is therefore gated on Silero VAD before it reaches a transcriber, so
 silence is never transcribed at all. It costs ~20ms and it covers both backends.
 `--no-speech-gate` turns it off.
+
+### Answering back
+
+The mirror replies out loud to what it hears. A local language model
+(`mlx-community/Llama-3.2-1B-Instruct-4bit`, ~0.1-0.5s a line) writes one short
+cheeky sentence and macOS's own `say` speaks it, so nothing leaves the machine
+and there is no TTS dependency to install. The reply is spoken only — it is deliberately not put on screen, so the text
+belongs to the people in the room. It is composed and spoken on its own thread,
+and the transcript reaches the screen and the prompt before the reply is even
+queued, so answering back cannot hold either of them up.
+
+```sh
+--no-banter                # stay quiet
+--banter-chance 0.4        # answer four remarks in ten (default 0.7)
+--banter-voice "Bad News"  # any macOS voice; the novelty ones suit the theme
+--no-banter-llm            # canned lines only, no model
+```
+
+Replies come out of **the handset's earpiece**, not the room: `--speaker`
+picks the output the same way `--camera` and `--mic` pick theirs, preferring the
+USB device. Because the earpiece is at someone's ear and the microphone is in
+the same handset, there is no feedback path and nothing needs muting.
+
+If you ever run it with the speaker open to the room, add `--banter-mute-mic`:
+the mirror will otherwise hear its own reply, transcribe it and answer itself,
+on and on. That flag mutes the microphone while it talks and discards audio
+captured during speech rather than buffering it.
+
+A remark arriving while a reply is already in flight is dropped rather than
+queued, so it never builds a backlog to work through.
+
+### The idle prompt
+
+After `--idle-after` seconds of silence (default 40, `0` disables) a centred
+call to action eases up over the picture — a headline with one suggestion under
+it, taking about three and a half seconds to arrive on a smoothstep rather than
+a linear ramp.
+
+An appearance then **runs for 30 seconds and ends**, whether or not anyone has
+spoken in the meantime, and cannot come back for **five minutes**. It is a nudge
+rather than a nag, and it should not sit there for as long as a room happens to
+stay quiet. Each appearance holds one suggestion start to finish; the next takes
+the next line in the list. The lines sit still — the only movement is the fade in and out. `overlay.IDLE_VISIBLE_SECONDS` and
+`IDLE_REPEAT_SECONDS` set the two intervals. Edit `overlay.IDLE_HEADLINE` and `overlay.IDLE_SUGGESTIONS` for the
+wording.
 
 Moderation runs by default, as it does on `/transcribe`. The classifier
 (`facebook/roberta-hate-speech-dynabench-r4-target`) only catches targeted hate

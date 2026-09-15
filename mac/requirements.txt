@@ -31,5 +31,9 @@ pyobjc-framework-AVFoundation>=9.0
 # is the hosted backend's own stack, and its bundled Silero VAD is used to gate
 # silent chunks whichever transcriber is chosen, so install both.
 sounddevice>=0.4
+
+# Writes the mirror's spoken replies. Speech itself is macOS's own `say`, so
+# there is no TTS dependency.
+mlx-lm>=0.20
 mlx-whisper>=0.4
 faster-whisper>=1.0

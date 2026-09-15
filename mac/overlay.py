@@ -8,6 +8,7 @@ look the same.
 
 import math
 import random
+import zlib
 from pathlib import Path
 
 import cv2
@@ -36,6 +37,105 @@ PATH_BASE_Y = 350.0
 PATH_AMPLITUDE = 50.0
 # `text-lg` on the <text>, in viewBox units; the square build uses `text-3xl`.
 TEXT_SIZE_VB = 18.0
+
+
+# Each transcript gets its own route across the screen rather than one of two
+# fixed curves. Seeded from the transcript itself, so a line keeps the same path
+# for its whole life while no two lines share one.
+PATH_BAND_TOP = 0.10        # fraction of the band's height a path may start at
+PATH_BAND_BOTTOM = 0.84
+PATH_WAVES = (2, 5)         # inclusive range of crests
+PATH_AMPLITUDE_RANGE = (45.0, 120.0)
+PATH_TILT = 55.0            # how far the two ends may differ in height
+PATH_MAX_ELEVATION = 45.0   # degrees from horizontal an approach may take
+
+
+# Lines arriving close together are put in separate lanes, so two transcripts on
+# screen at once do not land on top of each other.
+PATH_LANES = 4
+
+
+def _catmull_rom_chain(points):
+    """Smooth cubic chain through `points`, as `M p0 C ...` control values.
+
+    Building each wave as its own bezier and alternating the control offsets up
+    and down leaves the tangent reversing at every joint, so the curve arrives
+    at a waypoint going one way and leaves going the other — a run of scallops
+    rather than a flowing line. Catmull-Rom sets each waypoint's tangent from
+    its neighbours instead, which is continuous across the joints by
+    construction.
+    """
+    if len(points) < 2:
+        return list(points)
+    padded = [points[0]] + list(points) + [points[-1]]
+    chain = [points[0]]
+    for i in range(1, len(padded) - 2):
+        p0, p1, p2, p3 = padded[i - 1], padded[i], padded[i + 1], padded[i + 2]
+        chain.append((p1[0] + (p2[0] - p0[0]) / 6.0,
+                      p1[1] + (p2[1] - p0[1]) / 6.0))
+        chain.append((p2[0] - (p3[0] - p1[0]) / 6.0,
+                      p2[1] - (p3[1] - p1[1]) / 6.0))
+        chain.append(p2)
+    return chain
+
+
+def converging_path(seed, lane, lanes, width, height, target, coin_radius):
+    """A path that comes in from off-screen and ends at the cat.
+
+    Every line travels the same way: in from an edge and down into the coin,
+    which is what makes the mirror look like it is listening rather than like
+    text is being scrolled past it. Lines arriving together are given different
+    approach directions so they converge from around the room rather than
+    stacking on one another.
+    """
+    rng = random.Random(seed)
+
+    # Approaches stay within PATH_MAX_ELEVATION of horizontal and always come
+    # from above the coin, which sits near the bottom of the frame. A steeper
+    # line has almost no screen to travel down and arrives before it can be
+    # read. Alternate lanes take opposite sides, so consecutive lines come in
+    # from opposite directions rather than always the same one.
+    lanes = max(2, lanes)
+    lane = lane % lanes
+    from_right = bool(lane % 2)
+    per_side = lanes // 2
+    sub = lane // 2
+    wedge = math.radians(PATH_MAX_ELEVATION)
+    elevation = wedge * (sub + rng.uniform(0.12, 0.88)) / per_side
+    # Screen y grows downward, so a negative sine puts the start above the coin.
+    angle = -elevation if from_right else math.pi + elevation
+
+    # Start well outside the frame so a line is already moving when it appears.
+    reach = math.hypot(width, height) * rng.uniform(0.62, 0.78)
+    start = (target[0] + math.cos(angle) * reach,
+             target[1] + math.sin(angle) * reach)
+
+    # Stop short of the centre: the glyphs should be gone by the time they would
+    # overlap the coin, and the fade does the rest.
+    end_gap = coin_radius * 0.55
+    end = (target[0] - math.cos(angle) * end_gap,
+           target[1] - math.sin(angle) * end_gap)
+
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    distance = math.hypot(dx, dy) or 1.0
+    nx, ny = -dy / distance, dx / distance      # perpendicular to the approach
+
+    waves = rng.randint(*PATH_WAVES)
+    swing = distance * rng.uniform(0.05, 0.11)
+    direction = 1 if rng.random() < 0.5 else -1
+
+    waypoints = [start]
+    for i in range(1, waves):
+        t = i / waves
+        # The wobble tapers to nothing at the cat, so the line settles into it
+        # instead of thrashing about as it arrives.
+        taper = (1.0 - t) ** 1.4
+        offset = swing * direction * rng.uniform(0.75, 1.25) * taper
+        waypoints.append((start[0] + dx * t + nx * offset,
+                          start[1] + dy * t + ny * offset))
+        direction = -direction
+    waypoints.append(end)
+    return _catmull_rom_chain(waypoints)
 
 
 def _wavy_paths(base_y, amplitude):
@@ -76,7 +176,7 @@ class Layout:
 def layout_for(stage_aspect):
     """Square-ish stages get the square build's geometry, wide ones the 16:9."""
     if stage_aspect < 1.2:
-        return Layout(0.09, 300.0, 60.0, 30.0)      # text-3xl
+        return Layout(0.09, 300.0, 60.0, 44.0)      # sized for the full-width sweep
     return Layout(COIN_RELATIVE_SIZE, PATH_BASE_Y, PATH_AMPLITUDE, TEXT_SIZE_VB)
 LEFT_PATH = [
     (0, PATH_BASE_Y),
@@ -89,8 +189,24 @@ RIGHT_PATH = [
     (650, PATH_BASE_Y + PATH_AMPLITUDE), (700, PATH_BASE_Y - PATH_AMPLITUDE), (900, PATH_BASE_Y),
 ]
 # leftFade runs opaque->transparent over x 0..40% of the 900-wide mask rect;
-# rightFade mirrors it from the right edge.
+# rightFade mirrors it from the right edge. Only used by the fixed-path layout.
 FADE_SPAN_VB = 0.40 * VIEWBOX_W
+# A line now fades up as it enters and away as it leaves, over this much of its
+# journey, rather than being masked toward the middle of the screen.
+TRAVEL_FADE = 0.18
+# Lines are tinted from the piece's own palette, picked per transcript.
+TEXT_COLOURS = ((255, 255, 255), COIN_BLUE_RGB, COIN_PINK_RGB)
+# Text dissolves as it reaches the coin rather than sliding under it: fully
+# clear at this multiple of the coin's radius, untouched beyond the outer one.
+COIN_FADE_INNER = 1.15
+COIN_FADE_OUTER = 2.6
+
+
+def coin_centre(stage_rect, relative_size=COIN_RELATIVE_SIZE):
+    """Where the coin sits, as (cx, cy, size), for whatever needs to avoid it."""
+    x, y, w, h = stage_rect
+    size = max(8, int(round(w * relative_size)))
+    return x + w / 2.0, y + h - h * COIN_BOTTOM_FRACTION - size / 2.0, size
 # The frontend puts the transcript band in the bottom 40% of its content box.
 BAND_FRACTION = 0.40
 
@@ -505,23 +621,174 @@ def find_font(explicit=None, assets_dir=None):
     return None
 
 
+# --- idle call to action ----------------------------------------------------
+IDLE_AFTER_SECONDS = 40.0      # quiet for this long and the mirror asks
+IDLE_FADE_SECONDS = 3.5        # deliberately languid, in and out
+IDLE_VISIBLE_SECONDS = 30.0    # how long one appearance lasts, fades included
+IDLE_REPEAT_SECONDS = 300.0    # and how long before it may appear again
+IDLE_HEADLINE = "pick up the phone"
+IDLE_SUGGESTIONS = (
+    "and tell me what to become",
+    "ask for something ridiculous",
+    "try: turn everyone into cats",
+    "whisper something you'd regret",
+    "go on, I'm listening",
+    "say it like you mean it",
+)
+
+
+class IdlePrompt:
+    """The centred nudge shown when nobody has said anything for a while.
+
+    Drawn with PIL for the same reason the settings panel is: real type and a
+    soft shadow, rather than stroked polygons.
+    """
+
+    def __init__(self, font_path=None, assets_dir=None,
+                 headline=IDLE_HEADLINE, suggestions=IDLE_SUGGESTIONS,
+                 after=IDLE_AFTER_SECONDS):
+        self.font_path = find_font(font_path, assets_dir)
+        self.headline = headline
+        self.suggestions = tuple(suggestions) or ("",)
+        self.after = after
+        self._fonts = {}
+        self._cache = None
+        self._cache_key = None
+        self._show_started = None
+        self._last_show = None
+        # Chosen once when an appearance begins and held until it ends, so the
+        # wording cannot change on its way off screen.
+        self._suggestion = suggestions[0] if suggestions else ""
+        self._spell = 0
+
+    def _font(self, size):
+        font = self._fonts.get(size)
+        if font is None:
+            font = (ImageFont.truetype(self.font_path, size) if self.font_path
+                    else ImageFont.load_default())
+            self._fonts[size] = font
+        return font
+
+    def visible(self, now, last_heard=None):
+        """How strongly to show it, 0 to 1, easing in and out.
+
+        An appearance runs for a fixed window once it starts — it is a nudge,
+        not a nag, and it should not sit there for as long as a room happens to
+        stay quiet.
+        """
+        if self._show_started is None:
+            return 0.0
+        elapsed = now - self._show_started
+        if elapsed < 0 or elapsed > IDLE_VISIBLE_SECONDS:
+            return 0.0
+        raw = min(1.0,
+                  elapsed / IDLE_FADE_SECONDS,
+                  (IDLE_VISIBLE_SECONDS - elapsed) / IDLE_FADE_SECONDS)
+        raw = max(0.0, raw)
+        # Smoothstep, so it does not arrive and leave at a constant rate.
+        return raw * raw * (3.0 - 2.0 * raw)
+
+    def _track(self, now, last_heard):
+        """Start an appearance when it is due, and end it when its time is up."""
+        if self._show_started is not None:
+            if now - self._show_started >= IDLE_VISIBLE_SECONDS:
+                self._last_show = self._show_started
+                self._show_started = None
+            return
+
+        quiet = now if last_heard is None else now - last_heard
+        if quiet < self.after:
+            return
+        if self._last_show is not None and \
+                now - self._last_show < IDLE_REPEAT_SECONDS:
+            return                  # shown recently enough; leave the room alone
+        self._show_started = now
+        self._spell += 1
+        self._suggestion = self.suggestions[self._spell % len(self.suggestions)]
+
+    def _render_line(self, text, font, colour):
+        """One line of type on its own transparent panel, trimmed to fit."""
+        measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+        box = measure.textbbox((0, 0), text, font=font)
+        pad = max(4, int((box[3] - box[1]) * 0.22))
+        size = (box[2] - box[0] + pad * 2, box[3] - box[1] + pad * 2)
+        img = Image.new("RGBA", size, (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        origin = (pad - box[0], pad - box[1])
+        for offset in ((0, 3), (0, 2)):
+            d.text((origin[0] + offset[0], origin[1] + offset[1]), text,
+                   font=font, fill=(0, 0, 0, 150))
+        d.text(origin, text, font=font, fill=colour)
+        return np.asarray(img)
+
+    def _panels(self, height, suggestion):
+        """The two lines, cached until the size or the wording changes."""
+        key = (height, suggestion)
+        if key == self._cache_key:
+            return self._cache
+        big = self._font(max(18, int(height * 0.085)))
+        small = self._font(max(12, int(height * 0.042)))
+        self._cache = (
+            self._render_line(self.headline, big, (255, 255, 255, 255)),
+            self._render_line(suggestion, small, COIN_PINK_RGB + (255,)),
+        )
+        self._cache_key = key
+        return self._cache
+
+    def draw(self, surface_bgr, now, last_heard, rect=None):
+        self._track(now, last_heard)
+        strength = self.visible(now)
+        if strength <= 0.0:
+            return
+        H, W = surface_bgr.shape[:2]
+        if rect is None:
+            rect = (0, 0, W, H)
+        x, y, w, h = rect
+        headline, suggestion = self._panels(h, self._suggestion)
+
+        gap = int(h * 0.034)
+        # Lay the lines out by their centres and from the *unwobbled* heights:
+        # the warped panels carry a margin for the rotation, and spacing off
+        # that pushes the second line far down the screen.
+        head_h, sugg_h = headline.shape[0], suggestion.shape[0]
+        centre_x = x + w // 2
+        head_centre = y + int(h * 0.40)
+        centres = (head_centre,
+                   head_centre + head_h // 2 + sugg_h // 2 + gap)
+
+        for index, panel in enumerate((headline, suggestion)):
+            ph, pw = panel.shape[:2]
+            px = centre_x - pw // 2
+            py = centres[index] - ph // 2
+            x0, y0 = max(0, px), max(0, py)
+            x1, y1 = min(W, px + pw), min(H, py + ph)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            piece = panel[y0 - py:y1 - py, x0 - px:x1 - px]
+            alpha = piece[:, :, 3:4].astype(np.float32) / 255.0 * strength
+            rgb = piece[:, :, :3][:, :, ::-1].astype(np.float32)
+            region = surface_bgr[y0:y1, x0:x1].astype(np.float32)
+            surface_bgr[y0:y1, x0:x1] = np.clip(
+                region * (1.0 - alpha) + rgb * alpha, 0, 255).astype(np.uint8)
+
+
 class TranscriptRenderer:
     """Draws live transcripts as glyphs running along the two wavy paths."""
 
     # Rotation is quantised before caching rotated glyphs; 2 degrees is well
     # under what is visible at these sizes and keeps the cache small.
-    ANGLE_STEP_DEGREES = 2.0
+    ANGLE_STEP_DEGREES = 1.0
     MAX_CACHE = 4096
 
     def __init__(self, font_path=None, assets_dir=None, layout=None):
         self.layout = layout
         self.font_path = find_font(font_path, assets_dir)
         self._font = None
+        self._font_big = None
         self._font_size = 0
         self._glyphs = {}
         self._rotated = {}
-        self._paths = None
-        self._paths_key = None
+        self._paths = {}
 
     def _ensure_font(self, size_px):
         if self._font is not None and size_px == self._font_size:
@@ -531,26 +798,41 @@ class TranscriptRenderer:
         else:
             self._font = ImageFont.load_default()
         self._font_size = size_px
+        self._font_big = None
         self._glyphs.clear()
         self._rotated.clear()
 
+    # Glyphs are drawn and rotated at this multiple of the display size, then
+    # area-averaged down. Rotating a glyph rendered at final size leaves the
+    # diagonals visibly ragged; supersampling is what makes the edges clean.
+    GLYPH_SUPERSAMPLE = 3
+
     def _glyph(self, ch):
-        """Alpha tile for one character, with the baseline midpoint at its centre."""
+        """Alpha tile for one character, with the baseline midpoint at its centre.
+
+        Kept at supersampled resolution — it is rotated before being reduced.
+        """
         cached = self._glyphs.get(ch)
         if cached is not None:
             return cached
-        size = self._font_size
+        scale = self.GLYPH_SUPERSAMPLE
         advance = self._font.getlength(ch)
-        tile = max(8, int(round(size * 3)))
+        tile = max(8, int(round(self._font_size * 3))) * scale
         img = Image.new("L", (tile, tile), 0)
         draw = ImageDraw.Draw(img)
-        # `font-bold` against a single-weight face: browsers synthesise bold, so
-        # approximate it with a light stroke.
-        stroke = max(0, int(round(size * 0.03)))
-        draw.text((tile / 2.0 - advance / 2.0, tile / 2.0), ch, font=self._font,
-                  fill=255, anchor="ls", stroke_width=stroke, stroke_fill=255)
+        # Sigmar is already a heavy face; the synthetic bold stroke only
+        # thickened the edges and made them rougher.
+        draw.text((tile / 2.0 - advance * scale / 2.0, tile / 2.0), ch,
+                  font=self._big_font(), fill=255, anchor="ls")
         self._glyphs[ch] = (img, advance)
         return self._glyphs[ch]
+
+    def _big_font(self):
+        if self._font_big is None:
+            size = self._font_size * self.GLYPH_SUPERSAMPLE
+            self._font_big = (ImageFont.truetype(self.font_path, size)
+                              if self.font_path else ImageFont.load_default())
+        return self._font_big
 
     def _rotated_glyph(self, ch, angle_deg):
         bucket = round(angle_deg / self.ANGLE_STEP_DEGREES)
@@ -560,41 +842,48 @@ class TranscriptRenderer:
             return cached
         img, advance = self._glyph(ch)
         # Screen y grows downwards, PIL rotates counter-clockwise.
-        rotated = img.rotate(-bucket * self.ANGLE_STEP_DEGREES, resample=Image.BILINEAR)
-        arr = np.asarray(rotated, dtype=np.uint8)
+        rotated = img.rotate(-bucket * self.ANGLE_STEP_DEGREES,
+                             resample=Image.BICUBIC)
+        big = np.asarray(rotated, dtype=np.uint8)
+        side = max(1, big.shape[0] // self.GLYPH_SUPERSAMPLE)
+        arr = cv2.resize(big, (side, side), interpolation=cv2.INTER_AREA)
         if len(self._rotated) > self.MAX_CACHE:
             self._rotated.clear()
         self._rotated[key] = (arr, advance)
         return arr, advance
 
-    def _screen_paths(self, key, sx, sy, band_top):
-        """The two paths mapped into screen pixels, cached.
+    def _screen_path(self, seed, lane, width, height, target, coin_radius, geometry):
+        """One transcript's route into the cat, in screen pixels, cached."""
+        key = (seed, lane, geometry)
+        cached = self._paths.get(key)
+        if cached is not None:
+            return cached
+        control = converging_path(seed, lane, PATH_LANES, width, height,
+                                  target, coin_radius)
+        path = _Path(control)
+        if len(self._paths) > 64:
+            self._paths.clear()
+        self._paths[key] = path
+        return path
 
-        The horizontal scale spans the whole display so transcripts sweep in
-        from the edges, while the vertical scale and the glyph size come from
-        the stage — otherwise widening the sweep would blow the text up with it.
-        """
-        if self._paths_key == key:
-            return self._paths
-        out = []
-        for path in (self.layout.left_path, self.layout.right_path) \
-                if self.layout is not None else (_LEFT, _RIGHT):
-            pts = path.points.copy()
-            pts[:, 0] *= sx
-            pts[:, 1] = pts[:, 1] * sy + band_top
-            out.append(_Path.from_polyline(pts))
-        self._paths_key = key
-        self._paths = out
-        return out
-
-    def _draw_text_on_path(self, layer, text, path, start_offset_fraction):
+    def _draw_text_on_path(self, layer, text, path, start_offset_fraction,
+                           alpha=1.0):
         """Stamp `text` along `path`, centred on the given fractional offset.
 
-        Everything here is already in screen pixels.
+        Glyphs take the path's tangent, so on a path running right to left they
+        would come out upside down and backwards. When the line is heading that
+        way the characters are laid down in reverse and turned through half a
+        turn, which puts the text the right way up and still reading forwards.
         """
         total_advance = sum(self._glyph(ch)[1] for ch in text)
-        s = start_offset_fraction * path.length - total_advance / 2.0
+        centre = start_offset_fraction * path.length
+        s = centre - total_advance / 2.0
         lh, lw = layer.shape[:2]
+
+        _, _, mid_angle = path.at(min(max(centre, 0.0), path.length))
+        flipped = math.cos(mid_angle) < 0.0
+        if flipped:
+            text = text[::-1]
 
         for ch in text:
             _, advance = self._glyph(ch)
@@ -602,10 +891,11 @@ class TranscriptRenderer:
             s += advance
             if ch == " ":
                 continue
-            # SVG does not render glyphs that fall off either end of the path.
             if mid < 0.0 or mid > path.length:
                 continue
             px, py, angle = path.at(mid)
+            if flipped:
+                angle += math.pi
             arr, _ = self._rotated_glyph(ch, math.degrees(angle))
             gh, gw = arr.shape
             x0 = int(round(px - gw / 2.0))
@@ -615,25 +905,36 @@ class TranscriptRenderer:
             if sx1 <= sx0 or sy1 <= sy0:
                 continue
             patch = arr[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0]
+            if alpha < 1.0:
+                patch = (patch.astype(np.float32) * alpha).astype(np.uint8)
             target = layer[sy0:sy1, sx0:sx1]
             np.maximum(target, patch, out=target)
 
-    def _fade_mask(self, width, scale, tx, is_left):
-        """Alpha ramp matching the leftFade / rightFade gradients."""
-        xs = (np.arange(width, dtype=np.float32) - tx) / scale  # viewBox x
-        if is_left:
-            ramp = 1.0 - xs / FADE_SPAN_VB
-        else:
-            ramp = 1.0 - (VIEWBOX_W - xs) / FADE_SPAN_VB
-        return np.clip(ramp, 0.0, 1.0)
+    def _coin_fade(self, x0, y0, shape, stage_rect, relative_size):
+        """Falloff so a line dissolves as it arrives at the coin."""
+        cx, cy, size = coin_centre(stage_rect, relative_size)
+        radius = size / 2.0
+        inner, outer = radius * COIN_FADE_INNER, radius * COIN_FADE_OUTER
+        h, w = shape
+        ys = (np.arange(h, dtype=np.float32) + y0 - cy)[:, None]
+        xs = (np.arange(w, dtype=np.float32) + x0 - cx)[None, :]
+        distance = np.sqrt(xs * xs + ys * ys)
+        return np.clip((distance - inner) / max(1.0, outer - inner), 0.0, 1.0)
 
-    def draw(self, surface_bgr, transcripts, now, stage_rect=None):
+    def _travel_alpha(self, progress):
+        """Fade a line up as it enters and away as it leaves."""
+        return float(min(1.0, progress / TRAVEL_FADE,
+                         (1.0 - progress) / TRAVEL_FADE))
+
+    def draw(self, surface_bgr, transcripts, now, stage_rect=None,
+             coin_relative_size=None):
         """Draw every live transcript across `surface_bgr`.
 
         `transcripts` is [(text, started_at, side)]. `stage_rect` is the picture
-        within the surface; the text band is sized and positioned against it,
-        the way the frontend lays it out in the bottom 40% of its content box,
-        while the sweep itself spans the full surface.
+        within the surface; the band is sized and positioned against it, the way
+        the frontend lays it out in the bottom of its content box, while the
+        sweep itself spans the full surface. Each line takes its own route and
+        its own colour, both seeded from the line so they never change under it.
         """
         if not transcripts:
             return
@@ -641,48 +942,58 @@ class TranscriptRenderer:
         if stage_rect is None:
             stage_rect = (0, 0, W, H)
         stage_x, stage_y, stage_w, stage_h = stage_rect
+        if coin_relative_size is None and self.layout is not None:
+            coin_relative_size = self.layout.coin_relative_size
 
-        # The frontend's band is the bottom 40% of the content box, with the
-        # viewBox fitted into it: 0.4 * stage_h / VIEWBOX_H.
+        # Glyph size still comes from the stage, so widening the screen does not
+        # enlarge the text with it.
         sy = stage_h * BAND_FRACTION / VIEWBOX_H
-        band_top = stage_y + stage_h * (1.0 - BAND_FRACTION)
-        sx = W / VIEWBOX_W
-
         size_vb = self.layout.text_size_vb if self.layout is not None else TEXT_SIZE_VB
         self._ensure_font(max(8, int(round(size_vb * sy))))
-        left_path, right_path = self._screen_paths((sx, sy, band_top, self._font_size),
-                                                   sx, sy, band_top)
 
-        for is_left in (True, False):
-            entries = [t for t in transcripts if (t[2] == "left") == is_left]
-            if not entries:
-                continue
-            layer = np.zeros((H, W), dtype=np.uint8)
-            drew = False
-            for text, started_at, _side in entries:
-                progress = (now - started_at) / SCROLL_DURATION
-                if progress < 0.0 or progress > 1.0:
-                    continue
-                # left path scrolls outward-in, right path mirrors it
-                offset = progress if is_left else (1.0 - progress)
-                self._draw_text_on_path(layer, text,
-                                        left_path if is_left else right_path, offset)
-                drew = True
-            if not drew:
-                continue
+        cx, cy, coin_size = coin_centre(stage_rect,
+                                        coin_relative_size or COIN_RELATIVE_SIZE)
+        target = (cx, cy)
+        coin_radius = coin_size / 2.0
+        geometry = (W, H, round(cx, 1), round(cy, 1), round(coin_radius, 1))
 
-            # Only touch the rows/columns the glyphs actually landed on —
-            # the text band is a small slice of a full-screen surface.
+        # One layer per colour: glyphs merge with max() within a layer, so they
+        # cannot be given individual colours inside one.
+        layers = {}
+        for text, started_at, _side in transcripts:
+            progress = (now - started_at) / SCROLL_DURATION
+            if progress < 0.0 or progress > 1.0:
+                continue
+            seed = f"{text}|{started_at:.3f}"
+            # Lane from a hash of the line, not from its arrival time: lines
+            # land about every 10s and quantising that to 2.5s buckets aliased
+            # exactly onto the four lanes, so every line took the same one and
+            # they all came in from the same side.
+            digest = zlib.crc32(seed.encode("utf-8"))
+            lane = digest % PATH_LANES
+            path = self._screen_path(seed, lane, W, H, target, coin_radius,
+                                     geometry)
+            # Always travels the same way: in from the edge, down into the cat.
+            offset = progress
+            colour = TEXT_COLOURS[(digest // PATH_LANES) % len(TEXT_COLOURS)]
+            layer = layers.get(colour)
+            if layer is None:
+                layer = layers[colour] = np.zeros((H, W), dtype=np.uint8)
+            self._draw_text_on_path(layer, text, path, offset,
+                                    self._travel_alpha(progress))
+
+        for colour, layer in layers.items():
+            # Only touch the rows and columns the glyphs actually landed on.
             x, y, w, h = cv2.boundingRect(layer)
             if w == 0 or h == 0:
                 continue
             pad = max(2, int(round(12 * sy)))
             x0, y0 = max(0, x - pad), max(0, y - pad)
             x1, y1 = min(W, x + w + pad), min(H, y + h + pad)
-            sub = layer[y0:y1, x0:x1]
-
-            alpha = sub.astype(np.float32) / 255.0
-            alpha *= self._fade_mask(W, sx, 0.0, is_left)[None, x0:x1]
+            alpha = layer[y0:y1, x0:x1].astype(np.float32) / 255.0
+            if coin_relative_size:
+                alpha *= self._coin_fade(x0, y0, alpha.shape, stage_rect,
+                                         coin_relative_size)
             if not alpha.any():
                 continue
 
@@ -694,11 +1005,13 @@ class TranscriptRenderer:
                 shifted = np.roll(alpha, dy, axis=0)
                 if dy > 0:
                     shifted[:dy] = 0.0
-                shadow = np.maximum(shadow, cv2.GaussianBlur(shifted, (k, k), 0) * strength)
+                shadow = np.maximum(shadow,
+                                    cv2.GaussianBlur(shifted, (k, k), 0) * strength)
             shadow *= (1.0 - alpha)
 
             sh, sw = alpha.shape
             alpha_composite(surface_bgr, np.zeros((sh, sw, 3), dtype=np.uint8),
                             shadow, x0, y0)
-            alpha_composite(surface_bgr, np.full((sh, sw, 3), 255, dtype=np.uint8),
-                            alpha, x0, y0)
+            tint = np.empty((sh, sw, 3), dtype=np.uint8)
+            tint[:, :] = (colour[2], colour[1], colour[0])      # RGB -> BGR
+            alpha_composite(surface_bgr, tint, alpha, x0, y0)

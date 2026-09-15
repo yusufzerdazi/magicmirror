@@ -24,6 +24,7 @@ import torch
 from PIL import Image
 from diffusers.utils.logging import disable_progress_bar
 
+import banter as banter_module
 import config_panel
 import depth as depth_module
 import devices
@@ -631,7 +632,8 @@ class LiveSettings:
         self.seed = args.seed
         self.rotation = args.rotation
         self.capture_fit = args.capture_fit
-        self.edge_style = EDGE_STYLES[0]
+        self.edge_style = (model_registry.MODELS[manager.name].edge_style
+                           or EDGE_STYLES[0])
         self.rotate_minutes = args.rotate_models
         self.tint_on = not args.no_tint
         self.background_on = args.background == "circles"
@@ -648,6 +650,8 @@ class LiveSettings:
             return False
         self.steps = spec.steps
         self.strength = spec.strength
+        if spec.edge_style:
+            self.edge_style = spec.edge_style
         self.pending_model = None
         return True
 
@@ -704,6 +708,7 @@ class TranscriptFeed:
     def __init__(self, lifetime=SCROLL_DURATION):
         self.lifetime = lifetime
         self.entries = collections.deque(maxlen=16)
+        self.last_heard = None      # drives the idle prompt
         self.lock = threading.Lock()
 
     def add(self, text):
@@ -712,6 +717,7 @@ class TranscriptFeed:
         side = "left" if int(now * 1000) % 2 == 0 else "right"
         with self.lock:
             self.entries.append((text, now, side))
+            self.last_heard = now
 
     def live(self, now):
         with self.lock:
@@ -1046,6 +1052,28 @@ def build_parser():
                         help="play each recorded chunk back, as the frontend does")
     parser.add_argument("--voice-chunk", type=float, default=CHUNK_SECONDS,
                         help="seconds of audio per transcription")
+    parser.add_argument("--no-banter", action="store_true",
+                        help="do not answer back out loud")
+    parser.add_argument("--speaker", default="auto", metavar="WHICH",
+                        help="where the replies come out: auto (default) prefers "
+                             "the USB handset, then the built-in speakers; or "
+                             "name a kind (usb/builtin) or a `say -a` id")
+    parser.add_argument("--banter-mute-mic", action="store_true",
+                        help="stop listening while speaking. Only needed if the "
+                             "speaker is open to the room rather than in a "
+                             "handset, where the mirror would hear itself")
+    parser.add_argument("--banter-voice", default=banter_module.DEFAULT_VOICE,
+                        help=f"macOS voice for the replies; try "
+                             f"{', '.join(banter_module.VOICES)}")
+    parser.add_argument("--banter-chance", type=float, default=0.7, metavar="P",
+                        help="probability of answering any given remark")
+    parser.add_argument("--banter-model", default=banter_module.DEFAULT_MODEL)
+    parser.add_argument("--no-banter-llm", action="store_true",
+                        help="use the canned lines instead of the language model")
+    parser.add_argument("--idle-after", type=float,
+                        default=overlay.IDLE_AFTER_SECONDS, metavar="SECONDS",
+                        help="how long to wait in silence before prompting "
+                             "people to speak; 0 turns it off")
     parser.add_argument("--no-speech-gate", action="store_true",
                         help="transcribe every chunk, including ones with no "
                              "speech in them — Whisper invents text out of room "
@@ -1093,6 +1121,8 @@ def main():
         print("  ", devices.describe(devices.list_cameras()))
         print("microphones (sounddevice index):")
         print("  ", devices.describe(devices.list_microphones()))
+        print("speakers (`say -a` id):")
+        print("  ", devices.describe(devices.list_speakers()))
         for kind in ("auto", "usb", "builtin", "iphone"):
             index, name, _, why = devices.pick_camera(None if kind == "auto" else kind)
             print(f"  --camera {kind:8} -> "
@@ -1171,10 +1201,16 @@ def main():
                          batch_size=args.batch)
     transcripts = TranscriptFeed()
 
+    banter = None
+
     def announce_transcript(text):
+        # On screen and into the prompt first; the spoken reply is queued for
+        # another thread afterwards so it cannot hold either of them up.
         transcripts.add(text)
         if args.voice_prompt:
             print(f"voice -> prompt: {prompt_state.set_prompt(text)!r}", flush=True)
+        if banter is not None:
+            banter.hear(text)
 
     voice = None
     if args.voice:
@@ -1190,9 +1226,25 @@ def main():
             mic_index, mic_name, mic_kind = None, "system default", "unknown"
         print(f"microphone: {mic_name} ({mic_kind}, {mic_why})", flush=True)
 
+        if not args.no_banter:
+            speaker_id, speaker_name, speaker_kind, speaker_why = \
+                devices.pick_speaker(args.speaker)
+            print(f"speaker: {speaker_name} ({speaker_kind}, {speaker_why})",
+                  flush=True)
+            banter = banter_module.Banter(
+                model=args.banter_model, voice=args.banter_voice,
+                output_device=speaker_id,
+                use_llm=not args.no_banter_llm, reply_chance=args.banter_chance)
+            banter.start()
+            print(f"banter: voice={args.banter_voice}, "
+                  f"{'llm' if not args.no_banter_llm else 'canned lines'}, "
+                  f"chance={args.banter_chance}", flush=True)
+
         voice = VoiceListener(
             announce_transcript,
             input_device=mic_index,
+            mute_while=(banter.is_speaking
+                        if banter is not None and args.banter_mute_mic else None),
             backend=args.whisper_backend,
             model=args.whisper_model,
             chunk_seconds=args.voice_chunk,
@@ -1202,6 +1254,11 @@ def main():
         )
         if not voice.try_start():
             voice = None
+
+    idle_prompt = None
+    if args.idle_after > 0:
+        idle_prompt = overlay.IdlePrompt(font_path=args.font, assets_dir=ASSETS_DIR,
+                                         after=args.idle_after)
 
     layout = overlay.layout_for(stage_aspect)
     coin = None if args.no_coin else overlay.CoinRenderer(
@@ -1238,7 +1295,8 @@ def main():
     cv2.waitKey(1)
 
     print("controls (with the window focused): p=type a prompt  o=second prompt  "
-          "[/]=blend  s=reseed  r=rotate  h=preview  f=fullscreen  q=quit", flush=True)
+          "c=settings  [/]=blend  s=reseed  r=rotate  h=preview  f=fullscreen  "
+          "q or esc=quit", flush=True)
     print(CommandReader.USAGE, flush=True)
 
     background = overlay.MorphingCircles() if args.background == "circles" else None
@@ -1313,7 +1371,12 @@ def main():
             live = transcripts.live(now)
             if live:
                 text_renderer.draw(canvas, live, now,
-                                   stage_rect=(sx, sy, stage_w, stage_h))
+                                   stage_rect=(sx, sy, stage_w, stage_h),
+                                   coin_relative_size=(layout.coin_relative_size
+                                                       if coin is not None else 0))
+        if idle_prompt is not None and voice is not None:
+            idle_prompt.draw(canvas, now, transcripts.last_heard,
+                             rect=(sx, sy, stage_w, stage_h))
         if coin is not None:
             coin.draw(canvas, now, rect=(sx, sy, stage_w, stage_h))
         if show_preview:
@@ -1367,7 +1430,7 @@ def main():
                 editing = (label, buffer[:-1])
             elif 32 <= key < 127:
                 editing = (label, buffer + chr(key))
-        elif key == ord("q"):
+        elif key == ord("q") or key == 27:      # escape, once nothing owns it
             quit_requested.set()
         elif key == ord("f"):
             fullscreen = not fullscreen
@@ -1408,6 +1471,8 @@ def main():
             last_report = now
 
     commands.close()
+    if banter is not None:
+        banter.close()
     if voice is not None:
         voice.close()
     worker.close()

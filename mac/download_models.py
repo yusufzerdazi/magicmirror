@@ -62,6 +62,14 @@ def fetch_preprocessors():
     snapshot_download("depth-anything/Depth-Anything-V2-Small-hf")
 
 
+def fetch_banter(model=None):
+    import banter
+
+    name = model or banter.DEFAULT_MODEL
+    print(f"\n=== spoken replies\ndownloading {name}...", flush=True)
+    snapshot_download(name)
+
+
 def fetch_voice():
     print("\n=== voice and moderation", flush=True)
     print("downloading facebook/roberta-hate-speech-dynabench-r4-target...", flush=True)
@@ -101,6 +109,7 @@ def main():
         fetch_preprocessors()
     if not args.no_voice:
         fetch_voice()
+        fetch_banter()
     print("\ndone.", flush=True)
 
 

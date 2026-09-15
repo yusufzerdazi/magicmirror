@@ -20,7 +20,7 @@ from diffusers.utils.logging import disable_progress_bar
 
 class ModelSpec:
     def __init__(self, name, repo, vae, steps, strength, size, note, loader=None,
-                 one_step=False, control_repo=None):
+                 one_step=False, control_repo=None, edge_style=None):
         self.name = name
         self.repo = repo
         self.vae = vae
@@ -36,6 +36,9 @@ class ModelSpec:
         # This is how a one-step model can act as a mirror at all: the picture
         # is conditioning on a text-to-image pass, not a partly-denoised init.
         self.control_repo = control_repo
+        # The control image this model looks best with; applied whenever it is
+        # loaded, the way its steps and strength are.
+        self.edge_style = edge_style
         self.loader = loader or (_load_controlnet if control_repo else _load_standard)
 
     def load(self, device, dtype):
@@ -104,6 +107,7 @@ MODELS = {
         "sdxs-512", "IDKiro/sdxs-512-dreamshaper", None,
         steps=1, strength=1.0, size=512, one_step=True,
         control_repo="IDKiro/sdxs-512-dreamshaper-sketch",
+        edge_style="depth-raw",
         note="one-step SD1.5 driven through its sketch ControlNet; the camera "
              "goes in as a line drawing. strength is the ControlNet scale."),
     "sdxl-lightning": ModelSpec(
@@ -122,7 +126,7 @@ DISABLED_MODELS = ("sd-turbo", "sdxl-lightning")
 #: The models the config panel and --model offer, in rotation order.
 AVAILABLE = tuple(name for name in MODELS if name not in DISABLED_MODELS)
 
-DEFAULT_MODEL = "sdxl-turbo"
+DEFAULT_MODEL = "sdxs-512"
 
 
 class ModelManager:
