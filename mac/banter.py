@@ -1,6 +1,7 @@
 """Cheeky spoken replies to whatever the mirror just heard.
 
-A small local language model writes one short line back, and macOS speaks it.
+A small local language model writes one short line back, and Kokoro (a small
+neural voice, see tts.py) speaks it — or macOS `say` if Kokoro is unavailable.
 Both run on the machine — nothing leaves it, and there is no network dependency
 at a venue.
 
@@ -69,7 +70,8 @@ class Banter:
     """Writes and speaks a reply, one at a time, off the render thread."""
 
     def __init__(self, model=DEFAULT_MODEL, voice=DEFAULT_VOICE, rate=SPEECH_RATE,
-                 use_llm=True, on_reply=None, reply_chance=1.0, output_device=None):
+                 use_llm=True, on_reply=None, reply_chance=1.0, output_device=None,
+                 tts=None, output_name=None, persona=None, tts_voice=None):
         self.model_name = model
         self.voice = voice
         self.rate = rate
@@ -79,6 +81,15 @@ class Banter:
         # `say -a` id of the output to speak through — the handset, normally.
         # None leaves it on the system default.
         self.output_device = output_device
+        # Natural speech: a tts.KokoroVoice, played to the sounddevice output
+        # that matches `output_name`. persona() -> (system prompt, Kokoro
+        # voice) lets each radio station have its own host.
+        self.tts = tts
+        self.output_name = output_name
+        self.persona = persona
+        self.tts_voice = tts_voice
+        self._play_index = None
+        self._play_index_for = object()
         self._model = None
         self._tokenizer = None
         self._queue = queue.Queue(maxsize=1)
@@ -125,12 +136,22 @@ class Banter:
         except queue.Full:
             return False
 
-    def _compose(self, heard):
+    def _persona(self):
+        system, voice = SYSTEM_PROMPT, self.tts_voice
+        if self.persona is not None:
+            try:
+                system, host = self.persona()
+                voice = voice or host
+            except Exception as e:
+                print(f"banter: persona failed ({e})", flush=True)
+        return system, voice
+
+    def _compose(self, heard, system=None):
         if self.use_llm and self._model is not None:
             try:
                 from mlx_lm import generate
 
-                messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                messages = [{"role": "system", "content": system or SYSTEM_PROMPT},
                             {"role": "user", "content": heard}]
                 prompt = self._tokenizer.apply_chat_template(
                     messages, add_generation_prompt=True, tokenize=False)
@@ -143,9 +164,30 @@ class Banter:
                 print(f"banter: generation failed ({e})", flush=True)
         return random.choice(CANNED)
 
-    def _speak(self, line):
+    def _speak_natural(self, line, voice):
+        """Kokoro through sounddevice; False if that was not possible."""
+        if self.tts is None or not self.tts.available():
+            return False
+        import tts as tts_module
+
+        got = self.tts.synthesise(line, voice or tts_module.DEFAULT_VOICE)
+        if got is None:
+            return False
+        if self._play_index_for != self.output_name:
+            self._play_index_for = self.output_name
+            self._play_index = tts_module.output_index(self.output_name)
+        try:
+            tts_module.play(got[0], got[1], device=self._play_index, gain=self.tts.gain)
+            return True
+        except Exception as e:
+            print(f"banter: playback failed ({e})", flush=True)
+            return False
+
+    def _speak(self, line, voice=None):
         self._speaking.set()
         try:
+            if self._speak_natural(line, voice):
+                return
             command = ["say", "-v", self.voice, "-r", str(self.rate)]
             if self.output_device is not None:
                 command += ["-a", str(self.output_device)]
@@ -167,16 +209,19 @@ class Banter:
                 heard = self._queue.get(timeout=0.25)
             except queue.Empty:
                 continue
-            line = self._compose(heard)
+            system, voice = self._persona()
+            line = self._compose(heard, system)
             if not line:
                 continue
-            print(f"banter: {line!r}", flush=True)
+            print(f"banter: {line!r}" + (f" ({voice})" if voice else ""), flush=True)
             if self.on_reply is not None:
                 self.on_reply(line)
-            self._speak(line)
+            self._speak(line, voice)
 
     def close(self):
         self._stop.set()
+        if self.tts is not None:
+            self.tts.close()
         if self._proc is not None:
             try:
                 self._proc.terminate()

@@ -3,6 +3,7 @@
     python download_models.py                 # the default model + voice + moderation
     python download_models.py --model sdxl-lightning
     python download_models.py --all           # every switchable model
+    python download_models.py --tts           # just the Kokoro reply voice
 
 SDXL-Lightning is the one worth doing ahead of time: it pulls the whole SDXL
 base checkpoint (~7GB) on top of its own UNet.
@@ -98,6 +99,35 @@ def fetch_voice():
         print("faster-whisper not installed; skipping the CPU fallback", flush=True)
 
 
+def fetch_tts():
+    """Kokoro's model and voices, and its venv (Python 3.10+) if missing."""
+    import subprocess
+    import urllib.request
+    from pathlib import Path
+
+    import tts
+
+    if not tts.TTS_PYTHON.exists():
+        for candidate in ("/opt/homebrew/bin/python3.13", "/opt/homebrew/bin/python3.12",
+                          "/opt/homebrew/bin/python3.11", "/opt/homebrew/bin/python3.10"):
+            if Path(candidate).exists():
+                print(f"creating .venv-tts with {candidate}...", flush=True)
+                subprocess.run([candidate, "-m", "venv", str(tts.TTS_PYTHON.parent.parent)],
+                               check=True)
+                subprocess.run([str(tts.TTS_PYTHON), "-m", "pip", "install", "-q",
+                                "kokoro-onnx"], check=True)
+                break
+        else:
+            print("no Python 3.10+ found (brew install python); replies will use "
+                  "macOS say", flush=True)
+    tts.MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    for name in tts.MODEL_FILES:
+        target = tts.MODEL_DIR / name
+        if not target.exists():
+            print(f"downloading Kokoro {name}...", flush=True)
+            urllib.request.urlretrieve(tts.MODEL_URL + name, str(target))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -106,8 +136,13 @@ def main():
     parser.add_argument("--all", action="store_true", help="fetch every model")
     parser.add_argument("--no-voice", action="store_true",
                         help="skip the transcription and moderation models")
+    parser.add_argument("--tts", action="store_true",
+                        help="only set up the Kokoro reply voice")
     args = parser.parse_args()
 
+    if args.tts:
+        fetch_tts()
+        return
     if args.all:
         wanted = list(registry.MODELS)
     else:
@@ -120,6 +155,7 @@ def main():
     if not args.no_voice:
         fetch_voice()
         fetch_banter()
+        fetch_tts()
     print("\ndone.", flush=True)
 
 

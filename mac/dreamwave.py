@@ -90,11 +90,12 @@ STYLE = ("surreal dreamlike vintage paper collage, halftone print texture, rich 
 
 
 class Station:
-    def __init__(self, freq, name, subject, place):
+    def __init__(self, freq, name, subject, place, host="af_heart"):
         self.freq = freq
         self.name = name
         self.subject = subject
         self.place = place          # the world around you, in Dream World
+        self.host = host            # the Kokoro voice that hosts this station
 
     @property
     def prompt(self):
@@ -108,35 +109,43 @@ STATIONS = (
     Station(88.1, "Cloud Walkers",
             "full body view of a dreamer whose body is made of soft white clouds, "
             "vivid blue sky behind",
-            "a kingdom of floating cloud islands in a vivid blue sky, golden light"),
+            "a kingdom of floating cloud islands in a vivid blue sky, golden light",
+            host="af_bella"),
     Station(90.7, "Radio Saints",
             "full body view of a radiant saint with a halo of radio waves and "
             "golden constellations on midnight blue, ornate gold embroidery",
-            "a midnight cathedral of radio towers under golden constellations"),
+            "a midnight cathedral of radio towers under golden constellations",
+            host="bm_george"),
     Station(93.3, "Moon Ballroom",
             "full body view of an elegant dancer in a silver sequined gown, giant "
             "moon and mirror ball, deep violet night",
-            "a ballroom on the surface of the moon, giant mirror ball, violet night sky"),
+            "a ballroom on the surface of the moon, giant mirror ball, violet night sky",
+            host="af_heart"),
     Station(95.9, "Deep Sea Static",
             "full body view of a glowing deep sea jellyfish person with "
             "bioluminescent tendrils, teal and turquoise underwater",
-            "a glowing coral reef city deep under a turquoise sea"),
+            "a glowing coral reef city deep under a turquoise sea",
+            host="am_michael"),
     Station(98.4, "Playa Mirage",
             "full body view of a desert wanderer in a fantastical fur coat and "
             "goggles, dust storm at golden hour, glowing art car",
-            "an endless desert playa at golden hour with glowing art cars and a giant effigy"),
+            "an endless desert playa at golden hour with glowing art cars and a giant effigy",
+            host="am_puck"),
     Station(101.1, "The Hypnotist",
             "full body view of a mysterious hypnotist with an all-seeing eye, black "
             "and cream op-art spiral, red velvet curtains",
-            "an endless hypnotic landscape of black and cream op-art spirals under a red sky"),
+            "an endless hypnotic landscape of black and cream op-art spirals under a red sky",
+            host="af_nicole"),
     Station(103.7, "Tin Radio Heart",
             "full body view of a vintage tin toy robot with a glowing radio dial for "
             "a heart, mint green and chrome",
-            "a retro-futurist city of chrome radio towers and mint green skies"),
+            "a retro-futurist city of chrome radio towers and mint green skies",
+            host="bm_fable"),
     Station(106.5, "Garden of Lost Keys",
             "full body view of a forest spirit made of flowers, antique keys and "
             "butterflies, lush green enchanted garden",
-            "an enchanted garden of giant flowers, hanging antique keys and butterflies"),
+            "an enchanted garden of giant flowers, hanging antique keys and butterflies",
+            host="bf_emma"),
 )
 DIAL_MIN, DIAL_MAX = 87.5, 108.0
 
@@ -200,6 +209,14 @@ BANTER_SYSTEM_PROMPT = (
     "never about anyone's body or appearance, never explicit. No emoji, no "
     "quotation marks, no stage directions. Just the sentence."
 )
+
+def banter_prompt(station):
+    """The host's brief, for whichever station is on."""
+    if station is None:
+        return BANTER_SYSTEM_PROMPT
+    return (BANTER_SYSTEM_PROMPT + f" You are the host of {station.name}, "
+            f"{station.freq:.1f} on the DREAMWAVE FM dial.")
+
 
 BANTER_CANNED = (
     "Signal received. The dream is real, and so are you.",
@@ -754,19 +771,84 @@ class DuskSky:
         return self._frame
 
 
-# --- the archway ----------------------------------------------------------------
-STAGE_HEIGHT_FRACTION = 0.94    # leaves sky above the arch for the ribbon
+# --- layout ---------------------------------------------------------------------
+# The picture is the whole height of the screen, edge to edge, with no frame;
+# a pillar stands either side of it and the props live in the bays beyond.
+PILLAR_R = 0.036        # pillar radius, in screen heights
+PILLAR_GAP = 0.004      # between the picture's edge and the pillar
 
 
-def dream_stage_rect(screen_w, screen_h, aspect):
-    """The stage, a little shorter than the screen and standing on its floor."""
-    max_h = screen_h * STAGE_HEIGHT_FRACTION
-    w = screen_w
-    h = int(round(w / aspect))
-    if h > max_h:
-        h = int(round(max_h))
-        w = int(round(h * aspect))
-    return (screen_w - w) // 2, screen_h - h, w, h
+def dream_stage_rect(screen_w, screen_h, aspect=1.0):
+    """The picture: as tall as the screen (or as wide, if narrower), centred."""
+    h = min(screen_h, int(round(screen_w / aspect)))
+    w = int(round(h * aspect))
+    return (screen_w - w) // 2, (screen_h - h) // 2, w, h
+
+
+def side_bay(screen_w, screen_h, aspect=1.0):
+    """(x0, x1) of the left bay in pixels, beyond the pillar; the right bay is
+    its mirror image. Narrow screens get a bay of zero width."""
+    sx, _, _, _ = dream_stage_rect(screen_w, screen_h, aspect)
+    x1 = sx - int(round((PILLAR_GAP + 2.5 * PILLAR_R) * screen_h))
+    return 0, max(0, x1)
+
+
+def masthead_image(width):
+    """The slogan for the top of the left bay: a coral ribbon reading TUNE IN,
+    with the promise under it."""
+    width = int(width)
+    ss = 3
+    W = width * ss
+    band_h = int(width * 0.30) * ss
+    tail = int(band_h * 0.42)
+    img = Image.new("RGBA", (W, int(band_h * 1.25)), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    top = int(band_h * 0.08)
+    dark = (150, 50, 58, 255)
+    for side in (-1, 1):
+        x_out = 0 if side < 0 else W
+        x_in = tail * 1.7 if side < 0 else W - tail * 1.7
+        y0, y1 = top + band_h * 0.22, top + band_h * 1.08
+        notch = x_out + (tail * 0.55 if side < 0 else -tail * 0.55)
+        d.polygon(((x_out, y0), (x_in, y0), (x_in, y1), (x_out, y1),
+                   (notch, (y0 + y1) / 2)), fill=dark)
+    d.rounded_rectangle((tail, top, W - tail, top + band_h * 0.86), radius=band_h // 10,
+                        fill=CORAL + (255,))
+    d.line((tail + band_h * 0.12, top + band_h * 0.12, W - tail - band_h * 0.12,
+            top + band_h * 0.12), fill=(255, 200, 190, 160), width=ss * 2)
+    size = int(band_h * 0.56)
+    f = font(size)
+    text = "TUNE IN"
+    while d.textlength(text, font=f) > (W - 2 * tail) * 0.70 and size > 10:
+        size -= ss
+        f = font(size)
+    tw = d.textlength(text, font=f)
+    bbox = d.textbbox((0, 0), text, font=f)
+    ty = top + (band_h * 0.86 - (bbox[3] - bbox[1])) / 2 - bbox[1]
+    d.text(((W - tw) / 2, ty), text, font=f, fill=CREAM + (255,))
+    star = band_h * 0.12
+    for sx_ in ((W - tw) / 2 - star * 2.2, (W + tw) / 2 + star * 2.2):
+        _star(d, sx_, top + band_h * 0.43, star, GOLD + (255,))
+    ribbon = img.resize((width, img.height // ss), Image.LANCZOS)
+
+    size = max(10, int(width * 0.11))
+    f2 = font(size)
+    line = "THE DREAM IS REAL"
+    measure = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    while measure.textlength(line, font=f2) > width * 0.94 and size > 10:
+        size -= 1
+        f2 = font(size)
+    out = Image.new("RGBA", (width, ribbon.height + int(size * 1.6)), (0, 0, 0, 0))
+    out.alpha_composite(ribbon, (0, 0))
+    d = ImageDraw.Draw(out)
+    tw = d.textlength(line, font=f2)
+    y = ribbon.height + int(size * 0.1)
+    d.text(((width - tw) / 2 + 2, y + 2), line, font=f2, fill=(20, 8, 30, 160))
+    d.text(((width - tw) / 2, y), line, font=f2, fill=CREAM + (255,))
+    return np.asarray(out)
+
+
+# --- the archway (unused since the full-height layout; kept for reference) ------
 
 
 def _bump(t, centre, width):
@@ -971,11 +1053,12 @@ class Backdrop:
 
     def compose(self, sky, arch, extras):
         """`extras`: [(rgba ndarray, x, y)] blitted on top, by identity."""
-        key = (id(sky), sky.shape, id(arch.layer),
+        key = (id(sky), sky.shape, id(arch.layer) if arch is not None else None,
                tuple((id(img), x, y) for img, x, y in extras))
         if key != self._key:
             frame = sky.copy()
-            arch.draw(frame)
+            if arch is not None:
+                arch.draw(frame)
             for img, x, y in extras:
                 blit_rgba(frame, img, x, y)
             self._frame = frame

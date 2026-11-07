@@ -2,13 +2,14 @@
 # Start the magic mirror with one command.
 #
 #   ./start.sh                     # the event setup (DREAMWAVE, London Decompression
-#                                  # 2026); uses the Kinect if plugged in
-#   ./start.sh --no-kinect         # ignore the Kinect
-#   ./start.sh --simulate          # no hardware: a simulated camera and Kinect
+#                                  # 2026): camera, handset, no Kinect
+#   ./start.sh --kinect            # also use the Kinect, if plugged in (needs sudo)
+#   ./start.sh --simulate          # no hardware: a simulated camera (and, with
+#                                  # --kinect, a simulated Kinect)
 #   ./start.sh --theme mischief    # the original look
 #   ./start.sh --windowed          # anything else is passed to app.py
 #
-# With a Kinect attached the mirror runs under sudo, because claiming the sensor
+# With --kinect and a Kinect attached the mirror runs under sudo, because claiming the sensor
 # over USB needs root on macOS, so you will be asked for your password. Without
 # one it runs as you. Either way it is a single foreground Python process.
 #
@@ -23,11 +24,13 @@ NEAR=${KINECT_NEAR:-600}
 FAR=${KINECT_FAR:-3000}
 EVENT=(--voice --voice-prompt)
 
-use_kinect=1
+use_kinect=0
 simulate=0
 app_args=()
 for arg in "$@"; do
-    if [ "$arg" = "--no-kinect" ]; then
+    if [ "$arg" = "--kinect" ]; then
+        use_kinect=1
+    elif [ "$arg" = "--no-kinect" ]; then
         use_kinect=0
     elif [ "$arg" = "--simulate" ]; then
         simulate=1
@@ -39,13 +42,15 @@ done
 if [ "$simulate" = 1 ]; then
     # Scripted people in front of a pretend camera and Kinect, for rehearsing
     # without the rig. Voice still uses the real microphone.
-    exec "$PY" app.py "${EVENT[@]}" --camera sim --depth sim \
+    depth=()
+    [ "$use_kinect" = 1 ] && depth=(--depth sim)
+    exec "$PY" app.py "${EVENT[@]}" --camera sim ${depth[@]+"${depth[@]}"} \
         ${app_args[@]+"${app_args[@]}"}
 fi
 
 if [ "$use_kinect" = 1 ] && ioreg -p IOUSB -w0 -l 2>/dev/null | grep -q '"Xbox NUI Camera"'; then
     echo "kinect found — the mirror needs sudo to reach it"
-    sudo -v || { echo "no sudo — run ./start.sh --no-kinect to use the camera"; exit 1; }
+    sudo -v || { echo "no sudo — run ./start.sh without --kinect to use the camera"; exit 1; }
 
     # A root run can leave root-owned files in the model cache, which would then
     # stop a normal run from writing to it. Hand any leftovers back first.
@@ -64,4 +69,5 @@ if [ "$use_kinect" = 1 ] && ioreg -p IOUSB -w0 -l 2>/dev/null | grep -q '"Xbox N
 fi
 
 [ "$use_kinect" = 1 ] && echo "no kinect found — using the camera"
+[ "$use_kinect" = 0 ] && echo "kinect off (./start.sh --kinect to use it)"
 exec "$PY" app.py "${EVENT[@]}" ${app_args[@]+"${app_args[@]}"}

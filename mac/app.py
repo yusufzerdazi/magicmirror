@@ -25,6 +25,8 @@ from PIL import Image
 from diffusers.utils.logging import disable_progress_bar
 
 import banter as banter_module
+import tts as tts_module
+import stage3d as stage3d_module
 import config_panel
 import depth as depth_module
 import devices
@@ -1252,10 +1254,14 @@ def build_parser():
                         help="dreamwave (default): London Decompression 2026 — "
                              "archway, radio dial, stations, on-air voice; "
                              "mischief: the original cat-and-coin look")
-    parser.add_argument("--world", choices=("auto", "on", "off"), default="auto",
-                        help="dreamwave: Dream World puts people inside a generated "
-                             "place with parallax and spoken objects. auto "
-                             "(default) alternates mirror and world each station")
+    parser.add_argument("--world", choices=("auto", "on", "off"), default="off",
+                        help="dreamwave: Dream World cuts people out and puts them "
+                             "inside a generated place with parallax. off "
+                             "(default); on; or auto, which alternates mirror and "
+                             "world each station. `w` toggles it live")
+    parser.add_argument("--no-3d", action="store_true",
+                        help="dreamwave: draw the flat stage instead of the 3D one "
+                             "(pillars, radio, mast and volumetric clouds)")
     parser.add_argument("--no-stations", action="store_true",
                         help="dreamwave: hold the prompt instead of tuning "
                              "through the stations")
@@ -1379,6 +1385,15 @@ def build_parser():
     parser.add_argument("--banter-chance", type=float, default=0.7, metavar="P",
                         help="probability of answering any given remark")
     parser.add_argument("--banter-model", default=banter_module.DEFAULT_MODEL)
+    parser.add_argument("--tts", choices=("kokoro", "say"), default="kokoro",
+                        help="the voice of the replies: kokoro (default; natural, "
+                             "local, falls back to say if not installed) or macOS say")
+    parser.add_argument("--tts-voice", default=None,
+                        help="one Kokoro voice for every reply (e.g. af_heart, "
+                             "bf_emma, bm_george); default: each station's own host")
+    parser.add_argument("--tts-speed", type=float, default=1.0)
+    parser.add_argument("--tts-gain", type=float, default=0.8,
+                        help="peak level of the replies, 0-1 (it is an earpiece)")
     parser.add_argument("--no-banter-llm", action="store_true",
                         help="use the canned lines instead of the language model")
     parser.add_argument("--idle-after", type=float,
@@ -1631,12 +1646,25 @@ def main():
                 devices.pick_speaker(args.speaker)
             print(f"speaker: {speaker_name} ({speaker_kind}, {speaker_why})",
                   flush=True)
+            natural = None
+            if args.tts == "kokoro":
+                natural = tts_module.KokoroVoice(speed=args.tts_speed,
+                                                 gain=args.tts_gain)
+                natural.start()
+            def station_persona():
+                station = tuner.station()
+                return dreamwave.banter_prompt(station), station.host
+            persona = station_persona if tuner is not None else None
             banter = banter_module.Banter(
                 model=args.banter_model, voice=args.banter_voice,
                 output_device=speaker_id,
-                use_llm=not args.no_banter_llm, reply_chance=args.banter_chance)
+                use_llm=not args.no_banter_llm, reply_chance=args.banter_chance,
+                tts=natural, output_name=speaker_name, persona=persona,
+                tts_voice=args.tts_voice)
             banter.start()
-            print(f"banter: voice={args.banter_voice}, "
+            print(f"banter: voice={args.tts if natural else 'say'} "
+                  f"({args.tts_voice or ('station hosts' if persona else 'af_heart')}"
+                  f" / fallback {args.banter_voice}), "
                   f"{'llm' if not args.no_banter_llm else 'canned lines'}, "
                   f"chance={args.banter_chance}", flush=True)
 
@@ -1719,11 +1747,18 @@ def main():
         background = dreamwave.DuskSky()
     else:
         background = overlay.MorphingCircles()
-    arch = dreamwave.Archway() if dream else None
+    # The picture is the full height of the screen, with nothing over it but
+    # the words and the coin; the arch of earlier builds is gone.
+    view3d = None
+    if dream and not args.no_3d:
+        view3d = stage3d_module.try_start(*screen_size)
+    parallax_viewer = world_module.Viewer() if view3d is not None else None
+    masthead = None
+    masthead_for = None
     static = dreamwave.Static() if dream else None
     dial = dreamwave.RadioDial() if dream else None
     glow = dreamwave.Glow() if dream else None
-    ribbon = footer = None
+    footer = None
     ribbon_for = None
     world_built_for = None
     backdrop = dreamwave.Backdrop() if dream else None
@@ -1867,37 +1902,63 @@ def main():
                 pic = person
             level = tuner.static_level(now) if tuner is not None else 0.0
             shown = static.apply(np.ascontiguousarray(pic), level, now) if level > 0 else pic
-            arch.prepare(screen_w, screen_h, (sx, sy, stage_w, stage_h))
-            if ribbon_for != (screen_w, screen_h, stage_w):
-                ribbon_for = (screen_w, screen_h, stage_w)
-                ribbon = np.asarray(dreamwave.ribbon_image(min(stage_w * 0.62,
-                                                               screen_w * 0.9)))
-                footer = dreamwave.footer_image(screen_h)
-            if background is not None and settings.background_on:
-                if hasattr(background, "set_portal"):
-                    background.set_portal((sx, sy, stage_w, stage_h))
-                background.update(now)
-                sky = background.render(screen_w, screen_h)
+            if tuner is not None:
+                freq, name, on_air = tuner.display(now)
             else:
-                if black_sky is None or black_sky.shape[:2] != (screen_h, screen_w):
-                    black_sky = np.zeros((screen_h, screen_w, 3), np.uint8)
-                sky = black_sky
-            fh, fw = footer.shape[:2]
-            extras = [(footer, screen_w - fw - 12, screen_h - fh - 10)]
-            if tuner is not None or presence is not None:
-                dw, dh = dial.size_for(screen_w, screen_h, sx)
-                if tuner is not None:
-                    freq, name, on_air = tuner.display(now)
+                freq, name, on_air = 88.1, "private channel", False
+            signal = presence.level if presence is not None else 0.0
+
+            frame3d = None
+            if view3d is not None:
+                if view3d.failed:
+                    view3d = None
                 else:
-                    freq, name, on_air = 88.1, "private channel", False
-                dial_img = dial.render(dw, dh, freq, name, on_air,
-                                       presence.level if presence is not None else 0.0,
-                                       now)
-                pad = max(10, int(screen_h * 0.025))
-                extras.append((dial_img, pad, screen_h - dh - pad))
-            np.copyto(canvas, backdrop.compose(sky, arch, extras))
-            arch.paste(canvas, arch.shade(np.ascontiguousarray(shown)),
-                       (sx, sy, stage_w, stage_h))
+                    view3d.resize(screen_w, screen_h)
+                    parallax_viewer.follow(presence, now, dt)
+                    station_name = tuner.station().name if tuner is not None else name
+                    view3d.update(
+                        freq=freq, name=station_name, on_air=on_air,
+                        heard=name if on_air else "", signal=signal, static=level,
+                        speaking=banter.is_speaking() if banter is not None else False,
+                        viewer=parallax_viewer.x,
+                        present=presence.present if presence is not None else False)
+                    frame3d = view3d.latest()
+                    if frame3d is not None and frame3d.shape[:2] != (screen_h, screen_w):
+                        frame3d = None
+            bay_x0, bay_x1 = dreamwave.side_bay(screen_w, screen_h, settings.stage_aspect)
+            bay_w = bay_x1 - bay_x0
+            if frame3d is not None:
+                np.copyto(canvas, frame3d)
+            else:
+                # The flat stage: painted sky, the dial and the small print.
+                if ribbon_for != (screen_w, screen_h):
+                    ribbon_for = (screen_w, screen_h)
+                    footer = dreamwave.footer_image(screen_h)
+                if background is not None and settings.background_on:
+                    if hasattr(background, "set_portal"):
+                        background.set_portal((sx, sy, stage_w, stage_h))
+                    background.update(now)
+                    sky = background.render(screen_w, screen_h)
+                else:
+                    if black_sky is None or black_sky.shape[:2] != (screen_h, screen_w):
+                        black_sky = np.zeros((screen_h, screen_w, 3), np.uint8)
+                    sky = black_sky
+                fh, fw = footer.shape[:2]
+                extras = [(footer, screen_w - fw - 12, screen_h - fh - 10)]
+                if bay_w > 120:
+                    dw_ = int(bay_w * 0.9)
+                    dh_ = int(dw_ * 0.62)
+                    dial_img = dial.render(dw_, dh_, freq, name, on_air, signal, now)
+                    extras.append((dial_img, (bay_w - dw_) // 2,
+                                   screen_h - dh_ - int(screen_h * 0.03)))
+                np.copyto(canvas, backdrop.compose(sky, None, extras))
+            canvas[sy:sy + stage_h, sx:sx + stage_w] = shown
+            if bay_w > 120:
+                if masthead_for != bay_w:
+                    masthead_for = bay_w
+                    masthead = dreamwave.masthead_image(bay_w * 0.9)
+                dreamwave.blit_rgba(canvas, masthead, (bay_w - masthead.shape[1]) // 2,
+                                    int(screen_h * 0.03))
         else:
             canvas[sy:sy + stage_h, sx:sx + stage_w] = stage[:, :, :3]
 
@@ -1923,9 +1984,6 @@ def main():
                 glow.draw(canvas, gx, gy, gsize * 0.9, now,
                           boost=1.0 if on_air else 0.0)
             coin.draw(canvas, now, rect=(sx, sy, stage_w, stage_h))
-        if dream:
-            dreamwave.blit_rgba(canvas, ribbon, sx + stage_w // 2 - ribbon.shape[1] // 2,
-                                max(0, sy - int(ribbon.shape[0] * 0.42)))
         if show_preview:
             draw_preview(canvas, capture, settings.rotation, prompt_state, fps,
                          len(stream.pending), depth_source)
@@ -2037,6 +2095,8 @@ def main():
     commands.close()
     if banter is not None:
         banter.close()
+    if view3d is not None:
+        view3d.close()
     if voice is not None:
         voice.close()
     worker.close()

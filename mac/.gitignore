@@ -2,3 +2,5 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+.venv-tts/
+models/
