@@ -565,6 +565,7 @@ class InferenceWorker:
             # and img2img models want the colour image full stop.
             style = settings.edge_style
             use_depth = (style == KINECT_STYLE and self.depth_source is not None
+                         and settings.kinect_on
                          and _spec.control_repo and self.depth_source.fresh())
             if style == KINECT_STYLE and not use_depth:
                 # No live sensor: estimated depth from the camera is the nearest
@@ -801,6 +802,8 @@ class LiveSettings:
         self.rotation = args.rotation
         self.capture_fit = args.capture_fit
         self.has_kinect = False         # set once the depth source is up
+        self.kinect_on = True           # the Kinect can be switched off live
+        self.can_drop_kinect = True     # False when it is the only input
         self.edge_style = (model_registry.MODELS[manager.name].edge_style
                            or EDGE_STYLES[0])
         self.rotate_minutes = args.rotate_models
@@ -914,6 +917,24 @@ class LiveSettings:
         self.world_mode = modes[(modes.index(self.world_mode) + delta) % len(modes)]
         print(f"dream world: {self.world_mode}", flush=True)
 
+    def toggle_world(self, showing):
+        """The `w` key: whatever is on screen now, switch to the other."""
+        self.world_mode = "off" if showing else "on"
+        print(f"dream world: {self.world_mode}", flush=True)
+
+    def kinect_live(self):
+        return self.has_kinect and self.kinect_on
+
+    def toggle_kinect(self, _delta=1):
+        if not self.has_kinect:
+            print("kinect: none attached", flush=True)
+            return
+        if self.kinect_on and not self.can_drop_kinect:
+            print("kinect: it is the only input, staying on", flush=True)
+            return
+        self.kinect_on = not self.kinect_on
+        print(f"kinect: {'on' if self.kinect_on else 'off (camera only)'}", flush=True)
+
     def adjust_depth(self, near_delta, far_delta):
         """Move the Kinect's working volume live, 100mm a step."""
         near = min(max(self.depth_near + 100 * near_delta, 300), 2000)
@@ -961,7 +982,7 @@ class CommandReader:
     USAGE = ("commands (type in this terminal): <text> or 'prompt <text>' | "
              "'second <text>' | 'blend <0-1>' | 'seed <n>' | 'say <text>' | "
              "'model <name>' | 'steps <n>' | 'strength <x>' | 'tune' | "
-             "'world auto|on|off' | "
+             "'world auto|on|off' | 'kinect on|off' | "
              "'frame square|16:10' | 'upscaler off|lanczos|anime|general' | 'quit'")
 
     def __init__(self, prompt_state, on_seed, on_quit, on_transcript=None,
@@ -1014,6 +1035,10 @@ class CommandReader:
                 if rest in ("auto", "on", "off"):
                     self.settings.world_mode = rest
                 print(f"dream world: {self.settings.world_mode}", flush=True)
+            elif head_lower == "kinect" and self.settings is not None:
+                if rest in ("on", "off") and (rest == "on") != self.settings.kinect_on:
+                    self.settings.toggle_kinect()
+                print(f"kinect: {'on' if self.settings.kinect_on else 'off'}", flush=True)
             elif head_lower in ("tune", "station", "next") and self.tuner is not None:
                 self.tuner.resume()
                 self.tuner.next_station(reason="by hand")
@@ -1496,7 +1521,8 @@ def main():
                                 settings.input_aspect)
         capture.start()
         settings.on_framing = lambda fit: setattr(capture, "fit", fit)
-    elif depth_source is None:
+    settings.can_drop_kinect = capture is not None
+    if camera_index is None and depth_source is None:
         raise SystemExit("--camera none needs a working --depth source")
 
     def frame_changed():
@@ -1579,8 +1605,6 @@ def main():
                 subject = dreamwave.dream_from_words(text)
                 if subject:
                     tuner.go_live(subject, heard=text)
-                    if dream_world is not None and dream_world.active:
-                        dream_world.request_object(subject)
                 else:
                     print("voice: heard, but not drawn onto anyone", flush=True)
             else:
@@ -1685,7 +1709,7 @@ def main():
 
     print("controls (with the window focused): p=type a prompt  o=second prompt  "
           "c=settings  [/]=blend  s=reseed  r=rotate  h=preview  f=fullscreen  "
-          + ("t=next station  w=dream world auto/on/off  " if dream else "")
+          + ("t=next station  w=dream world on/off  k=kinect on/off  " if dream else "")
           + "q or esc=quit", flush=True)
     print(CommandReader.USAGE, flush=True)
 
@@ -1772,6 +1796,7 @@ def main():
             last_presence = now
             seen = None
             if depth_source is not None and depth_source.fresh() \
+                    and settings.kinect_live() \
                     and settings.edge_style == KINECT_STYLE:
                 seen = depth_source.preview()
                 if seen is not None:
@@ -1849,6 +1874,8 @@ def main():
                                                                screen_w * 0.9)))
                 footer = dreamwave.footer_image(screen_h)
             if background is not None and settings.background_on:
+                if hasattr(background, "set_portal"):
+                    background.set_portal((sx, sy, stage_w, stage_h))
                 background.update(now)
                 sky = background.render(screen_w, screen_h)
             else:
@@ -1869,7 +1896,8 @@ def main():
                 pad = max(10, int(screen_h * 0.025))
                 extras.append((dial_img, pad, screen_h - dh - pad))
             np.copyto(canvas, backdrop.compose(sky, arch, extras))
-            arch.paste(canvas, shown, (sx, sy, stage_w, stage_h))
+            arch.paste(canvas, arch.shade(np.ascontiguousarray(shown)),
+                       (sx, sy, stage_w, stage_h))
         else:
             canvas[sy:sy + stage_h, sx:sx + stage_w] = stage[:, :, :3]
 
@@ -1982,7 +2010,9 @@ def main():
         elif key == ord("s"):
             set_seed(seed_box[0] + 1)
         elif key == ord("w") and dream_world is not None:
-            settings.cycle_world(+1)
+            settings.toggle_world(world_showing)
+        elif key == ord("k"):
+            settings.toggle_kinect()
         elif key == ord("t") and tuner is not None:
             tuner.resume()
             tuner.next_station(reason="by hand")

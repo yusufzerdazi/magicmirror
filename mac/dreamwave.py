@@ -82,8 +82,11 @@ def font(size, name=DISPLAY_FONT):
 # --- stations -----------------------------------------------------------------
 # Every prompt ends in the shared style, so whatever the station, the picture
 # belongs to the same poster.
-STYLE = ("surreal dreamlike vintage paper collage, halftone print texture, "
-         "art deco poster, rich colours")
+# No "poster", "card", "portrait frame" or "archway": the picture is already
+# shown through an arch, and those words make the model draw a second frame or
+# arch inside it.
+STYLE = ("surreal dreamlike vintage paper collage, halftone print texture, rich "
+         "colours, full bleed")
 
 
 class Station:
@@ -103,35 +106,35 @@ class Station:
 # scenery — a mirror with nobody in it.
 STATIONS = (
     Station(88.1, "Cloud Walkers",
-            "full body portrait of a dreamer whose body is made of soft white clouds, "
+            "full body view of a dreamer whose body is made of soft white clouds, "
             "vivid blue sky behind",
-            "a kingdom of floating cloud islands and pink classical archways in a blue sky"),
+            "a kingdom of floating cloud islands in a vivid blue sky, golden light"),
     Station(90.7, "Radio Saints",
-            "full body portrait of a radiant saint with a halo of radio waves and "
-            "golden constellations on midnight blue, ornate tarot card",
+            "full body view of a radiant saint with a halo of radio waves and "
+            "golden constellations on midnight blue, ornate gold embroidery",
             "a midnight cathedral of radio towers under golden constellations"),
     Station(93.3, "Moon Ballroom",
-            "full body portrait of an elegant dancer in a silver sequined gown, giant "
+            "full body view of an elegant dancer in a silver sequined gown, giant "
             "moon and mirror ball, deep violet night",
             "a ballroom on the surface of the moon, giant mirror ball, violet night sky"),
     Station(95.9, "Deep Sea Static",
-            "full body portrait of a glowing deep sea jellyfish person with "
+            "full body view of a glowing deep sea jellyfish person with "
             "bioluminescent tendrils, teal and turquoise underwater",
             "a glowing coral reef city deep under a turquoise sea"),
     Station(98.4, "Playa Mirage",
-            "full body portrait of a desert wanderer in a fantastical fur coat and "
+            "full body view of a desert wanderer in a fantastical fur coat and "
             "goggles, dust storm at golden hour, glowing art car",
             "an endless desert playa at golden hour with glowing art cars and a giant effigy"),
     Station(101.1, "The Hypnotist",
-            "full body portrait of a mysterious hypnotist with an all-seeing eye, black "
+            "full body view of a mysterious hypnotist with an all-seeing eye, black "
             "and cream op-art spiral, red velvet curtains",
-            "an infinite theatre of red velvet curtains and black and cream spirals"),
+            "an endless hypnotic landscape of black and cream op-art spirals under a red sky"),
     Station(103.7, "Tin Radio Heart",
-            "full body portrait of a vintage tin toy robot with a glowing radio dial for "
+            "full body view of a vintage tin toy robot with a glowing radio dial for "
             "a heart, mint green and chrome",
             "a retro-futurist city of chrome radio towers and mint green skies"),
     Station(106.5, "Garden of Lost Keys",
-            "full body portrait of a forest spirit made of flowers, antique keys and "
+            "full body view of a forest spirit made of flowers, antique keys and "
             "butterflies, lush green enchanted garden",
             "an enchanted garden of giant flowers, hanging antique keys and butterflies"),
 )
@@ -183,7 +186,7 @@ def dream_from_words(text):
 
 
 def live_prompt(subject):
-    return f"full body portrait, {subject}, {STYLE}"
+    return f"full body view of {subject}, {STYLE}"
 
 
 # --- banter -------------------------------------------------------------------
@@ -501,117 +504,213 @@ def blit_rgba(canvas, rgba, x, y, opacity=1.0):
 
 
 # --- the sky behind everything ---------------------------------------------------
-class DuskSky:
-    """Dusk gradient, gold constellations, and paper clouds drifting across.
+CLOUD_DIR = ASSETS_DIR / "clouds"
 
-    The gradient and constellations are drawn once at full resolution; each
-    cloud is drawn once as a sprite and only moved, ten times a second, blended
-    into just the rectangle it covers.
+
+def _load_cloud_sprites():
+    """Photographic cloud cut-outs (BGRA), as in the poster's collage.
+
+    Generated once with the mirror's own model as white cumulus on black and
+    keyed out, so they carry their soft, wispy edges.
+    """
+    sprites = []
+    for path in sorted(CLOUD_DIR.glob("*.png")):
+        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if img is not None and img.ndim == 3 and img.shape[2] == 4:
+            # Soften whatever edge the cloud was cropped against.
+            h = img.shape[0]
+            fade = np.ones(h, np.float32)
+            n = max(2, h // 8)
+            fade[-n:] = np.linspace(1.0, 0.0, n) ** 1.5
+            img[:, :, 3] = (img[:, :, 3] * fade[:, None]).astype(np.uint8)
+            sprites.append(img)
+    return sprites
+
+
+def _procedural_cloud(rng, size=360):
+    """Fallback sprite if the cut-outs are missing: overlapping soft puffs."""
+    w, h = size, int(size * 0.6)
+    alpha = np.zeros((h, w), np.float32)
+    for _ in range(14):
+        r = rng.uniform(0.12, 0.26) * w
+        cx = rng.uniform(0.25, 0.75) * w
+        cy = h * 0.65 - rng.uniform(0, 0.35) * h * (1 - abs(cx / w - 0.5))
+        cv2.circle(alpha, (int(cx), int(cy)), int(r), 1.0, -1, cv2.LINE_AA)
+    alpha[int(h * 0.82):] = 0
+    alpha = cv2.GaussianBlur(alpha, (0, 0), 3)
+    shade = np.linspace(255, 205, h, dtype=np.float32)[:, None]
+    bgr_ = np.dstack([shade * np.ones((1, w), np.float32)] * 3)
+    return np.dstack([bgr_, alpha * 255]).astype(np.uint8)
+
+
+class DuskSky:
+    """The sky behind the arch.
+
+    A dusk gradient; warm light and faint rays spilling from behind the arch,
+    as if the portal were lit; gold constellations and astrolabe rings; a
+    halftone horizon and paper grain for the printed-collage feel; and
+    photographic clouds drifting across in two layers, far ones smaller,
+    dimmer and slower, all lit pink from underneath by the sunset.
+
+    The base is drawn once per screen size; each cloud is prepared once as a
+    lit sprite with a soft paper shadow and then only moved, ten times a
+    second, blended into just the rectangle it covers.
     """
 
-    TICK_SECONDS = 0.1          # clouds drift a pixel or two a tick
-    COUNT = 7
+    TICK_SECONDS = 0.1
+    COUNT = 11
 
     def __init__(self, seed=11):
         self.rng = random.Random(seed)
-        self.clouds = [self._new_cloud(initial=True) for _ in range(self.COUNT)]
+        self.sprites = _load_cloud_sprites() or [_procedural_cloud(self.rng)
+                                                 for _ in range(4)]
+        self.clouds = [self._new_cloud(layer=i % 2, initial=True)
+                       for i in range(self.COUNT)]
+        self.portal = None
         self._base = None
-        self._base_size = None
+        self._base_key = None
         self._frame = None
         self._frame_size = None
         self._last = None
-        self.version = 0            # bumps whenever the rendered sky changes
 
-    def _new_cloud(self, initial=False):
+    def set_portal(self, rect):
+        """Where the arch stands, so the light can come from behind it."""
+        if rect != self.portal:
+            self.portal = rect
+            self._frame = None
+
+    def _new_cloud(self, layer, initial=False):
         r = self.rng
-        puffs = []
-        n = r.randint(5, 8)
-        for k in range(n):
-            puffs.append((k / (n - 1) - 0.5 + r.uniform(-0.08, 0.08),
-                          r.uniform(-0.18, 0.08) - 0.25 * math.sin(math.pi * k / (n - 1)),
-                          r.uniform(0.18, 0.32)))
+        far = layer == 0
+        speed = r.uniform(0.003, 0.006) if far else r.uniform(0.006, 0.012)
         return {
-            "x": r.uniform(-0.1, 1.1) if initial else (-0.35 if r.random() < 0.5 else 1.35),
-            "y": r.uniform(0.08, 0.95),
-            "scale": r.uniform(0.1, 0.22),
-            "speed": r.uniform(0.004, 0.012) * (1 if r.random() < 0.5 else -1),
-            "puffs": puffs,
-            "tint": r.choice((CREAM, BLUSH, CREAM, (232, 226, 240))),
-            "alpha": r.uniform(0.82, 0.95),
-            "sprite": None,
+            "sprite": r.randrange(len(self.sprites)),
+            "flip": r.random() < 0.5,
+            "height": r.uniform(0.12, 0.19) if far else r.uniform(0.22, 0.36),
+            "x": r.uniform(-0.1, 1.1) if initial else (-0.3 if speed > 0 else 1.3),
+            "y": r.uniform(0.04, 0.5) if far else r.uniform(0.3, 0.92),
+            "speed": speed * (1 if r.random() < 0.5 else -1),
+            "dim": r.uniform(0.78, 0.88) if far else r.uniform(0.96, 1.06),
+            "opacity": 0.85 if far else 1.0,
+            "lit": None,
         }
 
-    def _sprite(self, c, h):
-        """A cloud cut from paper: drawn once at full size, then only moved."""
-        if c["sprite"] is not None and c["sprite"][0] == h:
-            return c["sprite"][1:]
-        unit = h
-        rad = [pr * c["scale"] * unit * 1.3 for _, _, pr in c["puffs"]]
-        xs = [px * c["scale"] * 1.6 * unit for px, _, _ in c["puffs"]]
-        ys = [py * c["scale"] * unit for _, py, _ in c["puffs"]]
-        pad = 4
-        x0 = int(min(x - r for x, r in zip(xs, rad))) - pad
-        x1 = int(max(x + r for x, r in zip(xs, rad))) + pad
-        y0 = int(min(y - r for y, r in zip(ys, rad))) - pad
-        y1 = int(max(y + r for y, r in zip(ys, rad))) + pad
-        mask = np.zeros((y1 - y0, x1 - x0), np.float32)
-        for x, y, r in zip(xs, ys, rad):
-            cv2.circle(mask, (int(x - x0), int(y - y0)), max(1, int(r)), 1.0, -1, cv2.LINE_AA)
-        mask = cv2.GaussianBlur(mask, (0, 0), 1.2) * c["alpha"]
-        rows = np.linspace(0.0, 1.0, mask.shape[0], dtype=np.float32)[:, None, None]
-        shade = 1.0 - 0.24 * np.clip((rows - 0.35) / 0.65, 0, 1)
-        colour = (np.array(bgr(c["tint"]), np.float32) * shade).astype(np.float32)
-        colour = np.broadcast_to(colour, mask.shape + (3,)).astype(np.float32)
-        # Offsets are relative to the cloud's anchor point.
-        c["sprite"] = (h, colour, mask, x0, y0)
-        return c["sprite"][1:]
+    def _lit(self, c, h):
+        """The cloud's sprite at its size, lit for dusk, with a paper shadow."""
+        if c["lit"] is not None and c["lit"][0] == h:
+            return c["lit"][1:]
+        src = self.sprites[c["sprite"]]
+        if c["flip"]:
+            src = src[:, ::-1]
+        th = max(8, int(c["height"] * h))
+        tw = max(8, int(src.shape[1] * th / src.shape[0]))
+        spr = cv2.resize(src, (tw, th), interpolation=cv2.INTER_AREA).astype(np.float32)
+        col, a = spr[:, :, :3], spr[:, :, 3] / 255.0 * c["opacity"]
+        # Sunset from below: cream on top, pink and a little violet underneath.
+        rows = np.linspace(0.0, 1.0, th, dtype=np.float32)[:, None, None]
+        top = np.array((228, 242, 255), np.float32) / 255.0          # BGR, warm cream
+        under = np.array((178, 160, 255), np.float32) / 255.0        # BGR, sunset pink
+        light = top + (under - top) * np.clip((rows - 0.25) / 0.75, 0, 1)
+        col = col * light * c["dim"]
+        # A soft shadow below and to the right, as if pasted on. Everything is
+        # stored premultiplied: frame = frame * (1 - alpha) + colour.
+        pad = max(6, th // 7)
+        H2, W2 = th + pad * 2, tw + pad * 2
+        ca = np.zeros((H2, W2), np.float32)
+        ca[pad:pad + th, pad:pad + tw] = a
+        cc = np.zeros((H2, W2, 3), np.float32)
+        cc[pad:pad + th, pad:pad + tw] = col * a[:, :, None]
+        shadow = np.zeros((H2, W2), np.float32)
+        dy, dx = pad // 4, pad // 6
+        shadow[pad + dy:pad + dy + th, pad + dx:pad + dx + tw] = a
+        shadow = cv2.GaussianBlur(shadow, (0, 0), pad * 0.22) * 0.22 * (1 - ca)
+        alpha = ca + shadow
+        colour = cc + np.array(bgr(INK), np.float32) * shadow[:, :, None]
+        c["lit"] = (h, colour, alpha[:, :, None],
+                    -W2 // 2, -H2 // 2)
+        return c["lit"][1:]
 
     def _make_base(self, w, h):
         ys = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None]
-        stops = ((0.0, NIGHT), (0.55, PLUM), (0.85, (150, 74, 84)), (1.0, (196, 104, 94)))
+        stops = ((0.0, (20, 20, 40)), (0.45, (58, 36, 70)), (0.75, (122, 62, 86)),
+                 (1.0, (198, 106, 98)))
         pos = np.array([p for p, _ in stops], np.float32)
         base = np.empty((h, w, 3), np.float32)
         for c in range(3):
             vals = np.array([col[2 - c] for _, col in stops], np.float32)
             base[:, :, c] = np.interp(ys, pos, vals)
+
+        # Light from behind the arch: a warm glow and faint rays.
+        if self.portal is not None:
+            px, py, pw, ph = self.portal
+            cx, cy = px + pw / 2.0, py + ph * 0.32
+        else:
+            cx, cy = w / 2.0, h * 0.35
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        dx, dy = xx - cx, yy - cy
+        dist = np.sqrt(dx * dx + dy * dy) / h
+        glow = np.exp(-(dist / 0.5) ** 2) * 0.32
+        warm = np.array(bgr((255, 150, 150)), np.float32)
+        base += (warm - base) * glow[:, :, None]
+        angle = np.arctan2(dy, dx)
+        rays = (np.cos(angle * 18) > 0.55).astype(np.float32)
+        rays = cv2.GaussianBlur(rays, (0, 0), 2.0) * np.exp(-(dist / 0.75) ** 2) * 0.07
+        base += (np.array(bgr(CREAM), np.float32) - base) * rays[:, :, None]
+
+        # Halftone horizon: coral dots growing towards the bottom edge.
+        tone = np.zeros((h, w), np.float32)
+        pitch = max(6, h // 120)
+        top = int(h * 0.68)
+        for y in range(top, h + pitch, pitch):
+            k = (y - top) / max(1, h - top)
+            rad = pitch * 0.5 * k ** 1.3
+            if rad < 0.6:
+                continue
+            off = (pitch // 2) if ((y - top) // pitch) % 2 else 0
+            for x in range(off, w + pitch, pitch):
+                cv2.circle(tone, (x, y), int(round(rad)), 1.0, -1, cv2.LINE_AA)
+        tone *= 0.28
+        dots = np.array(bgr((246, 150, 128)), np.float32)
+        base += (dots - base) * tone[:, :, None]
+
         img = Image.fromarray(np.clip(base, 0, 255).astype(np.uint8)[:, :, ::-1], "RGB")
         lines = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         d = ImageDraw.Draw(lines)
         r = random.Random(3)
-        gold = GOLD + (95,)
         unit = h
-        # Astrolabe rings, low in each corner, as on the poster's charcoal panels.
-        for cx, cy in ((0.08 * w, 0.82 * h), (w - 0.08 * w, 0.2 * h)):
-            for k, rad in enumerate((0.16, 0.22, 0.3, 0.36)):
+        # Astrolabe rings up in the corners, clear of the dial and small print.
+        for (ax, ay) in ((0.07 * w, 0.16 * h), (0.93 * w, 0.2 * h)):
+            for k, rad in enumerate((0.12, 0.17, 0.23, 0.27)):
                 rr = rad * unit
-                d.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=gold,
-                          width=2 if k % 2 else 1)
-            for a in range(0, 360, 15):
+                d.ellipse((ax - rr, ay - rr, ax + rr, ay + rr),
+                          outline=GOLD + (70 if k % 2 else 45,), width=1)
+            for a in range(0, 360, 10):
                 t = math.radians(a)
-                d.line((cx + math.cos(t) * 0.16 * unit, cy + math.sin(t) * 0.16 * unit,
-                        cx + math.cos(t) * 0.36 * unit, cy + math.sin(t) * 0.36 * unit),
-                       fill=GOLD + (45,), width=1)
-        # Constellations: a few joined stars.
-        for _ in range(9):
-            cx, cy = r.uniform(0, w), r.uniform(0, h * 0.75)
-            pts = [(cx, cy)]
-            for _ in range(r.randint(3, 6)):
+                d.line((ax + math.cos(t) * 0.23 * unit, ay + math.sin(t) * 0.23 * unit,
+                        ax + math.cos(t) * 0.27 * unit, ay + math.sin(t) * 0.27 * unit),
+                       fill=GOLD + (55,), width=1)
+        for _ in range(8):
+            sx_, sy_ = r.uniform(0, w), r.uniform(0, h * 0.6)
+            pts = [(sx_, sy_)]
+            for _ in range(r.randint(3, 5)):
                 ang = r.uniform(0, math.tau)
-                dist = r.uniform(0.03, 0.08) * unit
-                pts.append((pts[-1][0] + math.cos(ang) * dist,
-                            pts[-1][1] + math.sin(ang) * dist))
-            d.line(pts, fill=GOLD + (110,), width=1)
-            for px, py in pts:
-                s = r.uniform(2.0, 3.6)
-                d.ellipse((px - s, py - s, px + s, py + s), fill=GOLD + (220,))
-        # Loose stars.
-        for _ in range(int(w * h / 9000)):
-            px, py = r.uniform(0, w), r.uniform(0, h * 0.8)
-            s = r.choice((0.8, 1.0, 1.4))
-            d.ellipse((px - s, py - s, px + s, py + s),
-                      fill=CREAM + (r.randint(60, 180),))
+                dd = r.uniform(0.03, 0.07) * unit
+                pts.append((pts[-1][0] + math.cos(ang) * dd, pts[-1][1] + math.sin(ang) * dd))
+            d.line(pts, fill=GOLD + (80,), width=1)
+            for qx, qy in pts:
+                rad = r.uniform(1.6, 3.0)
+                d.ellipse((qx - rad, qy - rad, qx + rad, qy + rad), fill=GOLD + (210,))
+        for _ in range(int(w * h / 7000)):
+            qx, qy = r.uniform(0, w), r.uniform(0, h * 0.7)
+            rad = r.choice((0.7, 0.9, 1.3))
+            d.ellipse((qx - rad, qy - rad, qx + rad, qy + rad),
+                      fill=CREAM + (r.randint(50, 170),))
         img = Image.alpha_composite(img.convert("RGBA"), lines).convert("RGB")
-        return np.asarray(img)[:, :, ::-1].copy()
+        out = np.asarray(img)[:, :, ::-1].astype(np.float32)
+        # Paper grain.
+        grain = np.random.default_rng(9).normal(0, 4.0, (h, w)).astype(np.float32)
+        out += grain[:, :, None]
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     def update(self, now):
         if self._last is None:
@@ -623,33 +722,35 @@ class DuskSky:
         self._last += ticks * self.TICK_SECONDS
         for i, c in enumerate(self.clouds):
             c["x"] += c["speed"] * self.TICK_SECONDS * ticks
-            if c["x"] < -0.4 or c["x"] > 1.4:
-                self.clouds[i] = self._new_cloud()
+            if c["x"] < -0.35 or c["x"] > 1.35:
+                layer = 0 if c["height"] < 0.2 else 1
+                self.clouds[i] = self._new_cloud(layer)
         self._frame = None
 
     def render(self, w, h):
         if self._frame is not None and self._frame_size == (w, h):
             return self._frame
-        if self._base_size != (w, h):
+        key = (w, h, self.portal)
+        if self._base_key != key:
             self._base = self._make_base(w, h)
-            self._base_size = (w, h)
+            self._base_key = key
         frame = self._base.copy()
-        for c in self.clouds:
-            colour, mask, ox, oy = self._sprite(c, h)
+        # Far layer first.
+        for c in sorted(self.clouds, key=lambda c: c["height"]):
+            colour, alpha, ox, oy = self._lit(c, h)
             px = int(round(c["x"] * w)) + ox
             py = int(round(c["y"] * h)) + oy
-            mh, mw = mask.shape
+            mh, mw = alpha.shape[:2]
             x0, y0 = max(0, px), max(0, py)
             x1, y1 = min(w, px + mw), min(h, py + mh)
             if x1 <= x0 or y1 <= y0:
                 continue
-            a = mask[y0 - py:y1 - py, x0 - px:x1 - px, None]
+            a = alpha[y0 - py:y1 - py, x0 - px:x1 - px]
             col = colour[y0 - py:y1 - py, x0 - px:x1 - px]
             roi = frame[y0:y1, x0:x1].astype(np.float32)
-            frame[y0:y1, x0:x1] = (roi + (col - roi) * a).astype(np.uint8)
+            frame[y0:y1, x0:x1] = np.clip(roi * (1.0 - a) + col, 0, 255).astype(np.uint8)
         self._frame = frame
         self._frame_size = (w, h)
-        self.version += 1
         return self._frame
 
 
@@ -668,18 +769,33 @@ def dream_stage_rect(screen_w, screen_h, aspect):
     return (screen_w - w) // 2, screen_h - h, w, h
 
 
+def _bump(t, centre, width):
+    return np.exp(-((t - centre) / width) ** 2)
+
+
 class Archway:
-    """The poster's pink archway, framing the picture as a portal."""
+    """The poster's pink archway, built as carved stone around the picture.
+
+    The shape is turned into a height map — a moulded profile around the arch
+    (raised lips at both edges, a gentle swell between), fluted pilasters,
+    capitals where the arch springs, plinths at the foot and a keystone — and
+    lit from the upper left, so it reads as stone rather than a flat band. It
+    casts a soft shadow out onto the sky and another in onto the picture, which
+    is what sets the picture back *behind* it, through the opening.
+    """
+
+    LIGHT = np.array((-0.45, -0.65, 0.62), np.float32)
 
     def __init__(self):
         self._key = None
         self.mask = None
         self.layer = None
+        self.keep = None
 
     def geometry(self, w, h):
-        band = max(6, int(round(min(w, h) * 0.04)))
+        band = max(8, int(round(min(w, h) * 0.05)))
         rx = w / 2.0
-        ry = min(w / 2.0, h * 0.34)
+        ry = min(w / 2.0, h * 0.36)
         return band, rx, ry
 
     def prepare(self, screen_w, screen_h, rect):
@@ -689,16 +805,127 @@ class Archway:
         sx, sy, w, h = rect
         band, rx, ry = self.geometry(w, h)
         ss = 2
-        # Inner opening: the picture shows through here.
-        inner = Image.new("L", (w * ss, h * ss), 0)
-        d = ImageDraw.Draw(inner)
-        d.ellipse((band * ss, band * ss, (w - band) * ss, (2 * ry - band) * ss), fill=255)
-        d.rectangle((band * ss, ry * ss, (w - band) * ss, h * ss), fill=255)
-        inner = inner.resize((w, h), Image.LANCZOS)
-        self.mask = (np.asarray(inner) > 127)[:, :, None]
-        # The opening as row spans: below the spring line every row is the same
-        # span, so the bulk of the picture is one slice copy; only the curved
-        # rows above it need copying one at a time.
+        P = int(band * 0.6)                      # room for what juts out
+        W2, H2 = (w + 2 * P) * ss, (h + P) * ss
+        ox, oy = P * ss, P * ss                  # stage origin in the layer
+        B, R = band * ss, ry * ss
+
+        def shape(inset):
+            m = np.zeros((H2, W2), np.uint8)
+            cv2.ellipse(m, (int(ox + w * ss / 2), int(oy + R)),
+                        (int(w * ss / 2 - inset), int(R - inset)), 0, 180, 360, 255, -1,
+                        cv2.LINE_AA)
+            cv2.rectangle(m, (int(ox + inset), int(oy + R)),
+                          (int(ox + w * ss - inset), H2), 255, -1)
+            return m
+
+        outer, inner = shape(0), shape(B)
+        cap_h, cap_out = int(B * 0.75), int(B * 0.28)
+        base_h, base_out = int(B * 1.1), int(B * 0.22)
+        blocks = np.zeros((H2, W2), np.uint8)
+        for x0 in (ox, ox + w * ss - B):
+            cv2.rectangle(blocks, (int(x0 - cap_out), int(oy + R - cap_h)),
+                          (int(x0 + B + cap_out), int(oy + R)), 255, -1)
+            cv2.rectangle(blocks, (int(x0 - base_out), H2 - base_h),
+                          (int(x0 + B + base_out), H2), 255, -1)
+        # Nothing may jut into the opening: the picture shows there.
+        blocks[inner > 127] = 0
+        solid = np.maximum(outer, blocks)
+        stone = (solid > 127) & (inner <= 127)
+
+        # Height map.
+        d_in = cv2.distanceTransform((inner <= 127).astype(np.uint8), cv2.DIST_L2, 5)
+        d_out = cv2.distanceTransform((outer > 127).astype(np.uint8), cv2.DIST_L2, 5)
+        t = np.clip(d_in / np.maximum(d_in + d_out, 1e-3), 0, 1)
+        profile = (0.55 * _bump(t, 0.12, 0.08) + 0.55 * _bump(t, 0.88, 0.08)
+                   + 0.3 * np.sin(np.pi * t))
+        height = profile * B * 0.3
+        yy, xx = np.mgrid[0:H2, 0:W2].astype(np.float32)
+        pillar = (yy > oy + R + cap_h * 0.2) & (yy < H2 - base_h) & (outer > 127)
+        # Fluting: three shallow grooves down each pilaster.
+        for x0 in (ox, ox + w * ss - B):
+            local = (xx - x0) / B
+            inside = pillar & (local > 0.18) & (local < 0.82)
+            groove = 0.5 + 0.5 * np.cos((local - 0.18) / 0.64 * 3 * 2 * np.pi)
+            height[inside] -= (groove[inside] * B * 0.09)
+        blk = cv2.GaussianBlur((blocks > 127).astype(np.float32), (0, 0), B * 0.06)
+        height += blk * B * 0.38
+        # Mouldings across the capitals and plinths.
+        for y_line in (oy + R - cap_h * 0.55, H2 - base_h * 0.6):
+            band_rows = np.exp(-((yy - y_line) / (B * 0.07)) ** 2)
+            height += band_rows * blk * B * 0.12
+        # Keystone.
+        key_w = B * 1.25
+        kp = np.array([(ox + w * ss / 2 - key_w * 0.6, oy - B * 0.15),
+                       (ox + w * ss / 2 + key_w * 0.6, oy - B * 0.15),
+                       (ox + w * ss / 2 + key_w * 0.42, oy + B * 1.05),
+                       (ox + w * ss / 2 - key_w * 0.42, oy + B * 1.05)], np.int32)
+        keyst = np.zeros((H2, W2), np.uint8)
+        cv2.fillConvexPoly(keyst, kp, 255, cv2.LINE_AA)
+        keyst[inner > 127] = 0
+        stone |= keyst > 127
+        height += cv2.GaussianBlur((keyst > 127).astype(np.float32), (0, 0), B * 0.05) * B * 0.32
+        height = cv2.GaussianBlur(height, (0, 0), ss * 0.9)
+
+        gx = cv2.Sobel(height, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+        gy = cv2.Sobel(height, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+        n = np.dstack([-gx, -gy, np.ones_like(gx)])
+        n /= np.linalg.norm(n, axis=2, keepdims=True)
+        L = self.LIGHT / np.linalg.norm(self.LIGHT)
+        diffuse = np.clip((n * L).sum(axis=2), 0, 1)
+        half = L + np.array((0, 0, 1), np.float32)
+        half /= np.linalg.norm(half)
+        spec = np.clip((n * half).sum(axis=2), 0, 1) ** 28
+        edge = np.minimum(d_in, d_out)
+        ao = 1.0 - 0.28 * np.exp(-edge / (B * 0.06))
+        rng = np.random.default_rng(4)
+        grain = cv2.GaussianBlur(rng.normal(0, 1, (H2, W2)).astype(np.float32), (0, 0), 1.2)
+        mottle = cv2.GaussianBlur(rng.normal(0, 1, (H2 // 16 + 1, W2 // 16 + 1))
+                                  .astype(np.float32), (0, 0), 1.5)
+        mottle = cv2.resize(mottle, (W2, H2), interpolation=cv2.INTER_CUBIC)
+        albedo = np.array(bgr(SALMON), np.float32) * (1.0 + 0.05 * grain + 0.05 * mottle)[:, :, None]
+        shade = (0.5 + 0.68 * diffuse) * ao
+        colour = albedo * shade[:, :, None] + spec[:, :, None] * 70.0
+        colour = np.clip(colour, 0, 255)
+        alpha = stone.astype(np.float32)
+
+        # Shadow out onto the sky, down and to the right.
+        so = int(B * 0.25)
+        shadow = np.zeros((H2, W2), np.float32)
+        shadow[so:, so:] = alpha[:-so, :-so]
+        shadow = cv2.GaussianBlur(shadow, (0, 0), B * 0.4) * 0.4
+        shadow[inner > 127] = 0
+        out_alpha = alpha + shadow * (1 - alpha)
+        out_col = (colour * alpha[:, :, None]
+                   + np.array(bgr(INK), np.float32) * (shadow * (1 - alpha))[:, :, None])
+        out_col = out_col / np.maximum(out_alpha, 1e-4)[:, :, None]
+
+        # Shadow in onto the picture: the arch is in front of it.
+        cast = np.zeros((H2, W2), np.float32)
+        si = int(B * 0.35)
+        cast[si:, si // 2:] = alpha[:-si, :-(si // 2) or None]
+        cast = cv2.GaussianBlur(np.maximum(cast, alpha), (0, 0), B * 0.45)
+        rim = np.exp(-d_in / (B * 0.25)) * 0.3
+        inner_shadow = np.clip(cast * 0.6 + rim, 0, 0.62) * (inner > 127)
+
+        # Down to screen resolution, into screen space.
+        def down(a):
+            return cv2.resize(a, (W2 // ss, H2 // ss), interpolation=cv2.INTER_AREA)
+        lw, lh = W2 // ss, H2 // ss
+        lx, ly = sx - P, sy - P
+        art = np.zeros((screen_h, screen_w, 4), np.uint8)
+        rgba = np.dstack([down(out_col)[:, :, ::-1], down(out_alpha) * 255])
+        x0, y0 = max(0, lx), max(0, ly)
+        x1, y1 = min(screen_w, lx + lw), min(screen_h, ly + lh)
+        art[y0:y1, x0:x1] = np.clip(rgba[y0 - ly:y1 - ly, x0 - lx:x1 - lx], 0, 255)
+        self.layer = SparseLayer(art)
+        # The picture's own shadow is a darkening, applied as one multiply.
+        keep = 1.0 - down(inner_shadow)[P:P + h, P:P + w]
+        self.keep = np.repeat((keep * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+
+        # The opening, at stage resolution, as row spans for the paste.
+        opening = cv2.resize(inner, (lw, lh), interpolation=cv2.INTER_AREA)[P:P + h, P:P + w]
+        self.mask = (opening > 127)[:, :, None]
         m = self.mask[:, :, 0]
         self.full_from = int(math.ceil(ry))
         self.full_span = (band, w - band)
@@ -707,66 +934,6 @@ class Archway:
             xs = np.flatnonzero(m[y])
             if xs.size:
                 self.rows.append((y, int(xs[0]), int(xs[-1]) + 1))
-
-        # The band itself: salmon stone, fluted, with a cream inner edge.
-        art = Image.new("RGBA", (screen_w * 1, screen_h * 1), (0, 0, 0, 0))
-        layer = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
-        d = ImageDraw.Draw(layer)
-        outer_box = (0, 0, w * ss, 2 * ry * ss)
-        # Shadow cast outward onto the sky.
-        shadow = Image.new("L", (w * ss, h * ss), 0)
-        sd = ImageDraw.Draw(shadow)
-        sd.ellipse(outer_box, fill=140)
-        sd.rectangle((0, ry * ss, w * ss, h * ss), fill=140)
-        d.ellipse(outer_box, fill=SALMON + (255,))
-        d.rectangle((0, ry * ss, w * ss, h * ss), fill=SALMON + (255,))
-        # Fluting on the pillars.
-        for k in range(1, 4):
-            x = int(band * ss * k / 4)
-            d.line((x, ry * ss, x, h * ss), fill=(214, 128, 112, 255), width=ss)
-            d.line(((w - band) * ss + x, ry * ss, (w - band) * ss + x, h * ss),
-                   fill=(214, 128, 112, 255), width=ss)
-        # Capitals where the arch springs.
-        cap = int(band * 0.55)
-        for x0 in (0, (w - band) * ss):
-            d.rectangle((x0 - cap * ss // 3, (ry - cap) * ss, x0 + band * ss + cap * ss // 3,
-                         ry * ss), fill=BLUSH + (255,))
-            d.line((x0 - cap * ss // 3, ry * ss, x0 + band * ss + cap * ss // 3, ry * ss),
-                   fill=(200, 118, 104, 255), width=ss * 2)
-        # Keystone.
-        kw = band * 1.3
-        d.polygon(((w / 2 - kw * 0.6) * ss, 0, (w / 2 + kw * 0.6) * ss, 0,
-                   (w / 2 + kw * 0.4) * ss, band * 1.2 * ss,
-                   (w / 2 - kw * 0.4) * ss, band * 1.2 * ss), fill=BLUSH + (255,))
-        # Cut the opening back out and line it with cream.
-        hole = Image.new("L", (w * ss, h * ss), 0)
-        hd = ImageDraw.Draw(hole)
-        hd.ellipse((band * ss, band * ss, (w - band) * ss, (2 * ry - band) * ss), fill=255)
-        hd.rectangle((band * ss, ry * ss, (w - band) * ss, h * ss), fill=255)
-        la = np.asarray(layer).copy()
-        hole_a = np.asarray(hole)
-        la[hole_a > 0, 3] = 0
-        layer = Image.fromarray(la)
-        rim = Image.new("RGBA", (w * ss, h * ss), (0, 0, 0, 0))
-        rd = ImageDraw.Draw(rim)
-        rd.arc((band * ss, band * ss, (w - band) * ss, (2 * ry - band) * ss),
-               180, 360, fill=CREAM + (255,), width=3 * ss)
-        rd.line((band * ss + ss, ry * ss, band * ss + ss, h * ss), fill=CREAM + (255,),
-                width=3 * ss)
-        rd.line(((w - band) * ss - ss, ry * ss, (w - band) * ss - ss, h * ss),
-                fill=CREAM + (255,), width=3 * ss)
-        layer = Image.alpha_composite(layer, rim)
-        layer = layer.resize((w, h), Image.LANCZOS)
-        shadow = shadow.resize((w, h), Image.LANCZOS).filter(
-            ImageFilter.GaussianBlur(band * 0.5))
-        shadow_rgba = Image.new("RGBA", (w, h), INK + (0,))
-        shadow_rgba.putalpha(shadow)
-        # Shadow only outside the band, and only where it is not the opening.
-        sh = np.asarray(shadow_rgba).copy()
-        sh[np.asarray(inner) > 0, 3] = 0
-        art.alpha_composite(Image.fromarray(sh), (sx, sy))
-        art.alpha_composite(layer, (sx, sy))
-        self.layer = SparseLayer(np.asarray(art))
         self._key = key
 
     def paste(self, canvas, stage, rect):
@@ -778,7 +945,14 @@ class Archway:
             canvas[sy + y, sx + x0:sx + x1] = stage[y, x0:x1]
 
     def draw(self, canvas):
+        """The stone and its shadow on the sky (baked into the backdrop)."""
         self.layer.draw(canvas)
+
+    def shade(self, stage):
+        """The picture with the arch's shadow cast onto it (a new array)."""
+        if self.keep is None or self.keep.shape != stage.shape:
+            return stage
+        return cv2.multiply(stage, self.keep, scale=1.0 / 255.0)
 
 
 # --- the ribbon -----------------------------------------------------------------

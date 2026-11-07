@@ -159,6 +159,10 @@ class ConfigPanel:
             Field("dream world", lambda: st.world_mode, st.cycle_world,
                   hint="auto alternates mirror and world each station",
                   options=["auto", "on", "off"]),
+            Field("kinect", lambda: ("on" if st.kinect_on else "off")
+                  if st.has_kinect else "none", st.toggle_kinect,
+                  hint="k toggles; off = camera only, for depth and cut-outs",
+                  options=["on", "off"]),
             Field("kinect near", lambda: st.depth_near, lambda d: st.adjust_depth(d, 0),
                   fmt=lambda v: f"{v} mm", span=(300, 2000),
                   hint="nearest edge of the working volume"),

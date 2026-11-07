@@ -66,22 +66,34 @@ rather than a flat mirror.
   volume and any furniture, and anything nearer than it is a person. Kinect IR
   shadows are handled so that a patch of floor is never cut out as a person.
   Without a Kinect, estimated depth does the job.
-* Spoken things become **objects in the world**. Say "a giant jellyfish" and
-  one is generated, cut out and set floating beside you at a depth of its own,
-  in front of you or behind you depending on where you stand. When nobody is
-  asking, ambient things drift in: a radio, a paper moon, a crow, a key.
+* What you say still restyles *you*, as in the mirror, so you can become
+  something and then walk around inside the world as it.
 * `--world auto` (default) alternates mirror and world from one station to the
-  next; `on`/`off` hold it. `w` cycles it, and so does `world on` at the
-  terminal or the "dream world" row in the settings panel.
+  next; `on`/`off` hold it. `w` switches it on or off from whatever is showing;
+  `world auto|on|off` at the terminal and the "dream world" row in the
+  settings panel do the same.
 
-All world generation runs on the inference thread between batches. The
-picture never stalls; a new place or object arrives a fraction of a second
-later.
+**The Kinect can be switched off live** with `k` (or `kinect on|off`, or the
+"kinect" row in the panel). Off, the mirror runs from the camera alone:
+estimated depth drives the model and the cut-outs, and presence comes from
+motion. Useful if the sensor misbehaves at the venue. With no camera, the
+Kinect is the only input and stays on.
+
+World generation runs on the inference thread between batches. The picture
+never stalls; a new place arrives a fraction of a second later.
+
+**The frame.** The archway is carved stone, lit from the upper left, casting a
+shadow out onto the sky and in onto the picture. The clouds behind it are
+photographic cut-outs (`assets/clouds/`) made with the mirror's own model as
+white cumulus on black, keyed out and lit pink from below at runtime. Prompts
+avoid "poster", "card", "portrait" and "archway", which made the model draw a
+second frame inside the arch.
 
 | key | |
 | --- | --- |
 | `t` | next station (also resumes the dial after a typed prompt) |
-| `w` | Dream World: auto / on / off |
+| `w` | Dream World on / off |
+| `k` | Kinect on / off (off = camera only) |
 | `p` | type a prompt; this *holds* the dial on it until `t` |
 
 **Tuning the Kinect at the venue** no longer needs a restart: the settings panel
@@ -115,12 +127,12 @@ without a window. Remarks can be piped in as `say …` lines on stdin:
 
 | | warped | display |
 | --- | --- | --- |
-| sdxs-512 + Kinect, mirror | ~19-20 fps | ~48 fps |
-| sdxs-512 + Kinect, Dream World | ~18-19 fps | ~47 fps |
-| sdxs-512, camera only | ~14 fps | ~50 fps |
+| sdxs-512 + Kinect, mirror | ~19-20 fps | ~55 fps |
+| sdxs-512 + Kinect, Dream World | ~18-19 fps | ~50 fps |
+| sdxs-512, camera only (or `k` off) | ~14 fps | ~49 fps |
 | sdxl-turbo | ~7 fps | ~49 fps |
 
-A retune or a new world object costs a dip of a second or so.
+A retune or a new world costs a dip of a second or so.
 
 ## Setup
 

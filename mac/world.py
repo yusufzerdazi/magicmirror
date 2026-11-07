@@ -14,13 +14,12 @@ a generated place:
   night goes on, and anything nearer than it is a person. Without a Kinect the
   cut-out comes from estimated depth. Your restyled self is composited into
   the world with a faint gold rim, as if you had stepped through.
-* **Spoken things become objects in it.** Say "a giant jellyfish" and one is
-  generated, cut out, and set floating in the world at a depth of its own,
-  passing in front of you or behind you according to where you are standing.
+* **What you say still restyles you**, exactly as in the mirror, so you can
+  ask to become something and then walk around inside the world as it.
 
-All generation runs on the inference thread between batches (the GPU is shared,
-and two threads driving MPS at once is asking for trouble), so the mirror never
-stalls; a new world or object turns up a fraction of a second later.
+Places are generated on the inference thread between batches (the GPU is
+shared, and two threads driving MPS at once is asking for trouble), so the
+mirror never stalls; a new place turns up a fraction of a second later.
 """
 
 import math
@@ -34,8 +33,6 @@ import numpy as np
 import dreamwave
 
 WORK_SCALE = 0.5            # parallax is computed at half the stage size
-MAX_OBJECTS = 5
-OBJECT_LIFETIME = 120.0
 BACKDROP_FADE = 1.6
 PARALLAX = 0.075            # fraction of the width the nearest layer can slide
 DOLLY = 0.16                # how far stepping in pushes the camera forward
@@ -133,13 +130,8 @@ def _clean_mask(mask):
 
 
 # --- the world ------------------------------------------------------------------
-WORLD_STYLE = ("vast dreamlike landscape seen through an archway, deep perspective, "
-               "no people, " + dreamwave.STYLE)
-OBJECT_STYLE = ("a single {subject}, one isolated object floating in the centre, on a "
-                "pure black background, glowing, vintage paper collage cut-out")
-AMBIENT_OBJECTS = ("vintage radio", "golden antique key", "paper moon", "black crow",
-                   "disco mirror ball", "red telephone", "hot air balloon",
-                   "glowing jellyfish", "cassette tape", "all-seeing eye")
+WORLD_STYLE = ("vast dreamlike landscape, deep perspective, wide open view, no "
+               "people, no frame, " + dreamwave.STYLE)
 
 
 class Viewer:
@@ -148,7 +140,6 @@ class Viewer:
     def __init__(self):
         self.x = 0.0        # -1 left .. 1 right, as seen on screen
         self.z = 0.0        # 0 far .. 1 close to the mirror
-        self.person_z = 0.5
 
     def follow(self, presence, now, dt):
         if presence is not None and presence.present:
@@ -161,53 +152,10 @@ class Viewer:
         k = 1.0 - math.exp(-dt * 2.5)
         self.x += (tx - self.x) * k
         self.z += (tz - self.z) * k
-        if presence is not None:
-            self.person_z = 0.35 + 0.6 * presence.nearness
-
-
-class FloatingObject:
-    def __init__(self, subject, rgba, rng, now, spoken):
-        self.subject = subject
-        self.rgba = rgba
-        self.spoken = spoken
-        self.born = now
-        # Spoken things arrive near the front, beside whoever asked rather than
-        # over them; ambient things drift further back and further out.
-        side = rng.choice((-1, 1))
-        self.x = side * (rng.uniform(0.3, 0.5) if spoken else rng.uniform(0.4, 0.8))
-        self.y = rng.uniform(-0.32, -0.08)
-        self.z = rng.uniform(0.5, 0.9) if spoken else rng.uniform(0.15, 0.55)
-        self.phase = rng.uniform(0, math.tau)
-        self.spin = rng.uniform(-6, 6)
-
-    def opacity(self, now):
-        age = now - self.born
-        return max(0.0, min(1.0, age / 1.2, (OBJECT_LIFETIME - age) / 4.0))
-
-
-def object_cutout(rgb):
-    """A generated object on black -> RGBA cut-out, trimmed to its bounds."""
-    lum = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    alpha = np.clip((lum - 22.0) / 38.0, 0, 1)
-    hard = (alpha > 0.35).astype(np.uint8)
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(hard, connectivity=8)
-    if count <= 1:
-        return None
-    # The biggest piece is the object; the model sometimes adds sparkles.
-    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    if stats[biggest, cv2.CC_STAT_AREA] < rgb.shape[0] * rgb.shape[1] * 0.02:
-        return None
-    region = cv2.dilate((labels == biggest).astype(np.uint8), np.ones((15, 15), np.uint8))
-    alpha *= region
-    alpha = cv2.GaussianBlur(alpha, (5, 5), 0)
-    ys, xs = np.nonzero(alpha > 0.02)
-    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-    rgba = np.dstack([rgb, (alpha * 255).astype(np.uint8)])[y0:y1, x0:x1]
-    return np.ascontiguousarray(rgba)
 
 
 class DreamWorld:
-    """The generated place, the things floating in it, and the compositing."""
+    """The generated place, the parallax, and the compositing."""
 
     def __init__(self, submit, generate, estimate_depth, rng=None):
         # submit(job) queues job(pipe, encoder, spec) on the inference thread;
@@ -220,13 +168,11 @@ class DreamWorld:
         self.backdrop = None        # (rgb, depth) at native size
         self.previous = None
         self.changed_at = 0.0
-        self.objects = []
         self.viewer = Viewer()
         self.pending_backdrop = None
         self._grid_key = None
         self._grid = None
         self._work = {}             # per-backdrop resized copies
-        self._last_ambient = 0.0
         self.active = False
 
     # -- requests (any thread) ---------------------------------------------
@@ -249,37 +195,9 @@ class DreamWorld:
             print(f"world: built {place[:60]!r}", flush=True)
         self.submit(job)
 
-    def request_object(self, subject, spoken=True, seed=None):
-        prompt = OBJECT_STYLE.format(subject=subject)
-        seed = self.rng.randrange(1, 10_000) if seed is None else seed
-
-        def job(pipe, encoder, spec):
-            rgb = self.generate(pipe, encoder, spec, prompt, seed)
-            rgba = object_cutout(rgb)
-            if rgba is None:
-                print(f"world: could not cut out {subject!r}", flush=True)
-                return
-            with self.lock:
-                now = time.time()
-                self.objects.append(FloatingObject(subject, rgba, self.rng, now, spoken))
-                # Oldest ambient things make way first, then the oldest of all.
-                while len(self.objects) > MAX_OBJECTS:
-                    ambient = [o for o in self.objects if not o.spoken]
-                    self.objects.remove(ambient[0] if ambient else self.objects[0])
-            print(f"world: {subject!r} is floating in the world", flush=True)
-        self.submit(job)
-
     # -- per frame (render thread) ------------------------------------------
     def update(self, now, dt, presence):
         self.viewer.follow(presence, now, dt)
-        with self.lock:
-            self.objects = [o for o in self.objects if o.opacity(now) > 0
-                            or now - o.born < 1.0]
-            few = len(self.objects) < 3
-        if self.active and few and now - self._last_ambient > 25.0 \
-                and self.backdrop is not None:
-            self._last_ambient = now
-            self.request_object(self.rng.choice(AMBIENT_OBJECTS), spoken=False)
 
     def ready(self):
         return self.backdrop is not None
@@ -316,33 +234,6 @@ class DreamWorld:
         return cv2.remap(img, map_x, map_y, cv2.INTER_LINEAR,
                          borderMode=cv2.BORDER_REFLECT)
 
-    def _draw_objects(self, canvas, now, front, person_z):
-        h, w = canvas.shape[:2]
-        v = self.viewer
-        with self.lock:
-            objects = list(self.objects)
-        for o in sorted(objects, key=lambda o: o.z):
-            if (o.z > person_z) != front:
-                continue
-            alpha = o.opacity(now)
-            if alpha <= 0:
-                continue
-            size = w * (0.12 + 0.2 * o.z) * (1.0 + DOLLY * v.z * o.z)
-            oh, ow = o.rgba.shape[:2]
-            scale = size / max(oh, ow)
-            bob = 0.025 * math.sin(now * 0.8 + o.phase)
-            cx = w / 2 + (o.x * 0.5 - v.x * PARALLAX * 1.6 * (o.z - 0.35)) * w
-            cy = h * 0.5 + (o.y + bob) * h
-            ang = o.spin * math.sin(now * 0.3 + o.phase)
-            m = cv2.getRotationMatrix2D((ow / 2, oh / 2), ang, scale)
-            out_w, out_h = int(ow * scale * 1.2) + 2, int(oh * scale * 1.2) + 2
-            m[0, 2] += out_w / 2 - ow / 2
-            m[1, 2] += out_h / 2 - oh / 2
-            sprite = cv2.warpAffine(o.rgba, m, (out_w, out_h), flags=cv2.INTER_LINEAR,
-                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            dreamwave.blit_rgba(canvas, sprite, int(cx - out_w / 2), int(cy - out_h / 2),
-                                opacity=alpha)
-
     def render(self, person_bgr, person_alpha, now):
         """The world at stage size with the person composited into it."""
         h, w = person_bgr.shape[:2]
@@ -355,8 +246,6 @@ class DreamWorld:
             world = cv2.addWeighted(self._parallax(previous, ww, wh), 1.0 - k, world, k, 0)
         world = cv2.resize(world, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        person_z = self.viewer.person_z
-        self._draw_objects(world, now, front=False, person_z=person_z)
         if person_alpha is not None:
             a = person_alpha.astype(np.float32) * (1.0 / 255.0)
             # A faint gold rim where you meet the world, as if stepping through.
@@ -368,5 +257,4 @@ class DreamWorld:
             world = cv2.blendLinear(gold, world, rim, 1.0 - rim)
         else:
             world = person_bgr
-        self._draw_objects(world, now, front=True, person_z=person_z)
         return world
