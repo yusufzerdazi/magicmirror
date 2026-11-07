@@ -28,14 +28,16 @@ import banter as banter_module
 import config_panel
 import depth as depth_module
 import devices
+import dreamwave
 import models as model_registry
 import overlay
 import upscale as upscale_module
+import world as world_module
 from moderation import SafetyChecker
 from prompting import PromptEncoder, PromptState
 from voice import BACKENDS as VOICE_BACKENDS, CHUNK_SECONDS, VoiceListener
 
-WINDOW = "magicmirror"
+WINDOW = "dreamwave"
 ASSETS_DIR = Path(__file__).parent / "assets"
 
 # --- frontend (WarpPage.tsx) -----------------------------------------------
@@ -168,7 +170,11 @@ class TintCycle:
 class WebcamCapture:
     def __init__(self, camera_index, fit, stage_aspect=overlay.STAGE_ASPECT,
                  buffer_size=64):
-        self.cap = cv2.VideoCapture(camera_index)
+        if camera_index == "sim":
+            import simulate
+            self.cap = simulate.SimVideoCapture()
+        else:
+            self.cap = cv2.VideoCapture(camera_index)
         if not self.cap.isOpened():
             raise SystemExit(
                 f"could not open camera {camera_index}.\n"
@@ -346,7 +352,7 @@ def sketch_from_frame(rgb, style="sobel"):
 
 
 def warp_batch_control(pipe, encoder, frames, prompt, seed, device, scale,
-                       style="sobel"):
+                       style="sobel", controls_out=None):
     """One-step generation conditioned on the camera as a line drawing.
 
     `style=None` means the frames are already line drawings — what the depth
@@ -390,6 +396,8 @@ def warp_batch_control(pipe, encoder, frames, prompt, seed, device, scale,
             sketches = [sketch_from_frame(f, style) for f in frames]
     else:
         sketches = [sketch_from_frame(f, style) for f in frames]
+    if controls_out is not None:
+        controls_out[:] = [(style, s) for s in sketches]
     controls = [Image.fromarray(s) for s in sketches]
     generators = [torch.Generator(device=device).manual_seed(seed) for _ in frames]
     out = pipe(
@@ -445,6 +453,23 @@ def warp_batch_one_step(pipe, encoder, rgbs, prompt, seed, device, blend):
     return list(frames.cpu().numpy().astype(np.uint8))
 
 
+def generate_image(pipe, encoder, spec, prompt, seed, device):
+    """Plain text-to-image on whichever pipeline is loaded, for Dream World.
+
+    The ControlNet models get a blank control image at zero weight; the img2img
+    models start from noise at full strength, which amounts to the same thing.
+    """
+    if spec.control_repo:
+        blank = np.zeros((SIZE, SIZE, 3), dtype=np.uint8)
+        return warp_batch_control(pipe, encoder, [blank], prompt, seed, device, 0.0,
+                                  style=None)[0]
+    noise = np.random.default_rng(seed).integers(0, 256, (SIZE, SIZE, 3), dtype=np.uint8)
+    if spec.one_step:
+        return warp_batch_one_step(pipe, encoder, [noise], prompt, seed, device, 0.0)[0]
+    return warp_batch(pipe, encoder, [noise], prompt, seed, device, 1.0,
+                      max(2, spec.steps))[0]
+
+
 def warmup(pipe, encoder, prompt, seed, device, strength, steps, batch_size):
     dummy = [np.zeros((SIZE, SIZE, 3), dtype=np.uint8) for _ in range(batch_size)]
     for i in range(2):
@@ -475,13 +500,58 @@ class InferenceWorker:
         self.output_queue = output_queue
         self.stop_flag = threading.Event()
         self.last_batch_seconds = 0.6
+        # One-off GPU work (Dream World's places and objects), run between
+        # batches on this thread so MPS is only ever driven from one thread.
+        self.jobs = queue.Queue()
+        # Person masks travel with each frame as a fourth channel when asked
+        # for (Dream World composites people into a generated place).
+        self.with_masks = False
+        # Estimating depth just for a mask costs a frame or two a second, so
+        # that only happens while the world is actually wanted; the Kinect's
+        # masks are nearly free and keep learning the room regardless.
+        self.mono_masks = False
+        self.depth_background = world_module.DepthBackground()
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
     def start(self):
         self.thread.start()
 
+    def submit(self, job):
+        self.jobs.put(job)
+
+    def _run_jobs(self):
+        try:
+            job = self.jobs.get_nowait()
+        except queue.Empty:
+            return
+        pipe, encoder, spec = self.manager.current()
+        if pipe is None:
+            self.jobs.put(job)
+            return
+        try:
+            job(pipe, encoder, spec)
+        except Exception as e:
+            print(f"background job failed: {e}", flush=True)
+
+    def _masks(self, rgbs, use_depth, controls):
+        """A person mask per frame, or None if there is no way to tell."""
+        if use_depth:
+            return self.depth_background.masks(rgbs)
+        if controls and controls[0][0] == "depth-raw":
+            return world_module.mask_from_relative_depth(
+                [c[:, :, 0].astype(np.float32) / 255.0 for _, c in controls])
+        if not self.mono_masks:
+            return None
+        try:
+            planes = mono_depth(self.device).relative(rgbs)
+            return world_module.mask_from_relative_depth(planes)
+        except Exception as e:
+            print(f"no person mask ({e})", flush=True)
+            return None
+
     def _loop(self):
         while not self.stop_flag.is_set():
+            self._run_jobs()
             settings = self.settings
             seed = settings.seed
             prompt = self.prompt_state.composed()
@@ -515,13 +585,15 @@ class InferenceWorker:
                 rgbs = [self.tint.apply(r, now) for r in rgbs]
 
             t0 = time.time()
+            controls = []
             try:
                 if _spec.control_repo:
                     # The sensor hands over a finished depth map; everything
                     # else is built from the colour frame.
                     warped = warp_batch_control(
                         pipe, encoder, rgbs, prompt, seed, self.device,
-                        settings.strength, None if use_depth else style)
+                        settings.strength, None if use_depth else style,
+                        controls_out=controls)
                 elif _spec.one_step:
                     warped = warp_batch_one_step(pipe, encoder, rgbs, prompt, seed,
                                                  self.device, settings.strength)
@@ -533,8 +605,14 @@ class InferenceWorker:
                 time.sleep(0.2)
                 continue
 
+            masks = None
+            if self.with_masks:
+                masks = self._masks(rgbs, use_depth, controls)
+
             if settings.frame == WIDE_FRAME:
                 warped = [crop_band(w, WIDE_ASPECT, settings.crop_bias) for w in warped]
+                if masks is not None:
+                    masks = [crop_band(m, WIDE_ASPECT, settings.crop_bias) for m in masks]
             if self.upscaler is not None and settings.upscaler != "off":
                 h, w = warped[0].shape[:2]
                 try:
@@ -544,8 +622,14 @@ class InferenceWorker:
                     print(f"upscale error: {e}", flush=True)
             self.last_batch_seconds = time.time() - t0
 
-            for w in warped:
+            for i, w in enumerate(warped):
                 bgr = cv2.cvtColor(w, cv2.COLOR_RGB2BGR)
+                if masks is not None:
+                    m = masks[i]
+                    if m.shape[:2] != bgr.shape[:2]:
+                        m = cv2.resize(m, (bgr.shape[1], bgr.shape[0]),
+                                       interpolation=cv2.INTER_LINEAR)
+                    bgr = np.dstack([bgr, m])
                 try:
                     self.output_queue.put_nowait(bgr)
                 except queue.Full:
@@ -672,8 +756,16 @@ class FrameStream:
                 # The frame shape or upscaler was changed: fade from the old
                 # picture resized, rather than failing to blend.
                 h, w = self.incoming.shape[:2]
-                self.current = cv2.resize(self.current, (w, h),
-                                          interpolation=cv2.INTER_LINEAR)
+                if self.current.shape[:2] != (h, w):
+                    self.current = cv2.resize(self.current, (w, h),
+                                              interpolation=cv2.INTER_LINEAR)
+                # Person masks switched on or off: match the channel count.
+                cin, ccur = self.incoming.shape[2], self.current.shape[2]
+                if ccur < cin:
+                    self.current = np.dstack([self.current,
+                                              np.full((h, w), 255, np.uint8)])
+                elif ccur > cin:
+                    self.current = np.ascontiguousarray(self.current[:, :, :cin])
 
         if self.incoming is None:
             return self.current
@@ -724,6 +816,10 @@ class LiveSettings:
         self.on_seed = None
         self.on_framing = None
         self.on_frame = None
+        self.world_mode = getattr(args, "world", "auto")
+        self.depth_source = None
+        self.depth_near = args.depth_near
+        self.depth_far = args.depth_far
 
     @property
     def stage_aspect(self):
@@ -813,6 +909,20 @@ class LiveSettings:
     def toggle_background(self):
         self.background_on = not self.background_on
 
+    def cycle_world(self, delta):
+        modes = ["auto", "on", "off"]
+        self.world_mode = modes[(modes.index(self.world_mode) + delta) % len(modes)]
+        print(f"dream world: {self.world_mode}", flush=True)
+
+    def adjust_depth(self, near_delta, far_delta):
+        """Move the Kinect's working volume live, 100mm a step."""
+        near = min(max(self.depth_near + 100 * near_delta, 300), 2000)
+        far = min(max(self.depth_far + 100 * far_delta, near + 400), 6000)
+        self.depth_near, self.depth_far = near, far
+        source = self.depth_source
+        if source is not None and hasattr(source, "near"):
+            source.near, source.far = near, far
+
     def adjust_fade(self, delta):
         steps = [None, 0.05, 0.1, 0.15, 0.25, 0.5, 1.0]
         index = steps.index(self.fade_step) if self.fade_step in steps else 0
@@ -850,7 +960,8 @@ class CommandReader:
 
     USAGE = ("commands (type in this terminal): <text> or 'prompt <text>' | "
              "'second <text>' | 'blend <0-1>' | 'seed <n>' | 'say <text>' | "
-             "'model <name>' | 'steps <n>' | 'strength <x>' | "
+             "'model <name>' | 'steps <n>' | 'strength <x>' | 'tune' | "
+             "'world auto|on|off' | "
              "'frame square|16:10' | 'upscaler off|lanczos|anime|general' | 'quit'")
 
     def __init__(self, prompt_state, on_seed, on_quit, on_transcript=None,
@@ -862,8 +973,18 @@ class CommandReader:
         # Same switches the config panel drives, reachable without the window
         # having keyboard focus.
         self.settings = settings
+        # Dreamwave's dial: a typed prompt holds it, `tune` moves it on.
+        self.tuner = None
         self.stop_flag = threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
+
+    def _set_prompt(self, text):
+        if self.tuner is not None:
+            self.tuner.hold(text)
+            print(f"prompt (dial held — 'tune' to resume): "
+                  f"{self.prompt_state.composed()!r}", flush=True)
+        else:
+            print(f"prompt: {self.prompt_state.set_prompt(text)!r}", flush=True)
 
     def start(self):
         # Not gated on isatty: piped stdin is how the app gets driven from a
@@ -888,7 +1009,14 @@ class CommandReader:
             if head_lower in ("quit", "q", "exit"):
                 self.on_quit()
             elif head_lower in ("prompt", "p") and rest:
-                print(f"prompt: {self.prompt_state.set_prompt(rest)!r}", flush=True)
+                self._set_prompt(rest)
+            elif head_lower == "world" and self.settings is not None:
+                if rest in ("auto", "on", "off"):
+                    self.settings.world_mode = rest
+                print(f"dream world: {self.settings.world_mode}", flush=True)
+            elif head_lower in ("tune", "station", "next") and self.tuner is not None:
+                self.tuner.resume()
+                self.tuner.next_station(reason="by hand")
             elif head_lower in ("second", "secondprompt", "o") and rest:
                 print(f"prompt: {self.prompt_state.set_second_prompt(rest)!r}", flush=True)
             elif head_lower == "blend" and rest:
@@ -946,7 +1074,7 @@ class CommandReader:
                 except ValueError:
                     print("seed takes an integer", flush=True)
             else:
-                print(f"prompt: {self.prompt_state.set_prompt(line)!r}", flush=True)
+                self._set_prompt(line)
 
     def close(self):
         self.stop_flag.set()
@@ -1094,7 +1222,19 @@ def detect_screen_size(fallback=(1920, 1080)):
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prompt", default=INITIAL_PROMPT,
+    parser.add_argument("--theme", choices=("dreamwave", "mischief"),
+                        default="dreamwave",
+                        help="dreamwave (default): London Decompression 2026 — "
+                             "archway, radio dial, stations, on-air voice; "
+                             "mischief: the original cat-and-coin look")
+    parser.add_argument("--world", choices=("auto", "on", "off"), default="auto",
+                        help="dreamwave: Dream World puts people inside a generated "
+                             "place with parallax and spoken objects. auto "
+                             "(default) alternates mirror and world each station")
+    parser.add_argument("--no-stations", action="store_true",
+                        help="dreamwave: hold the prompt instead of tuning "
+                             "through the stations")
+    parser.add_argument("--prompt", default=None,
                         help="initial prompt (default: the frontend's INITIAL_PROMPT)")
     parser.add_argument("--second-prompt", default=SECOND_PROMPT,
                         help="prompt blended towards by --blend")
@@ -1237,6 +1377,10 @@ def build_parser():
                         help="debug: write composited frames into DIR")
     parser.add_argument("--dump-interval", type=float, default=1.0,
                         help="debug: seconds between dumped frames")
+    parser.add_argument("--headless", action="store_true",
+                        help="test: run without a window (use with --dump-frames)")
+    parser.add_argument("--run-for", type=float, default=0.0, metavar="SECONDS",
+                        help="test: quit after this long")
     parser.add_argument("--debug-geometry", action="store_true",
                         help="debug: log the window rect and stage size")
     parser.add_argument("--no-moderation", action="store_true",
@@ -1250,6 +1394,15 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    dream = args.theme == "dreamwave"
+    if args.prompt is None:
+        args.prompt = (dreamwave.STATIONS[0].prompt if dream else INITIAL_PROMPT)
+    if dream:
+        overlay.TEXT_COLOURS = dreamwave.TEXT_COLOURS
+        banter_module.SYSTEM_PROMPT = dreamwave.BANTER_SYSTEM_PROMPT
+        banter_module.CANNED = dreamwave.BANTER_CANNED
+        if args.font is None:
+            args.font = dreamwave.font_path()
 
     if args.batch < 1:
         raise SystemExit("--batch must be >= 1")
@@ -1278,7 +1431,10 @@ def main():
         return
 
     camera_index = None
-    if str(args.camera).lower() != "none":
+    if str(args.camera).lower() == "sim":
+        camera_index = "sim"
+        print("camera: simulated scene", flush=True)
+    elif str(args.camera).lower() != "none":
         camera_index, camera_name, camera_kind, camera_why = devices.pick_camera(args.camera)
         if camera_index is None:
             raise SystemExit(f"no camera to use — {camera_why}. "
@@ -1391,6 +1547,27 @@ def main():
     stream.prepare = fit_to_stage
     transcripts = TranscriptFeed()
 
+    tuner = None
+    presence = None
+    dream_world = None
+    if dream:
+        dream_world = world_module.DreamWorld(
+            submit=worker.submit,
+            generate=lambda pipe, enc, spec, prompt, seed: generate_image(
+                pipe, enc, spec, prompt, seed, device),
+            estimate_depth=lambda images: mono_depth(device).relative(images))
+        worker.with_masks = True
+        settings.depth_source = depth_source
+        # Load the depth estimator now, on the inference thread, rather than
+        # in the middle of the first world being built.
+        worker.submit(lambda pipe, enc, spec: mono_depth(device).relative(
+            [np.zeros((64, 64, 3), np.uint8)]))
+        presence = dreamwave.Presence()
+        if not args.no_stations:
+            tuner = dreamwave.Tuner(
+                prompt_state,
+                on_retune=lambda seed: settings.set_seed(seed))
+
     banter = None
 
     def announce_transcript(text):
@@ -1398,7 +1575,16 @@ def main():
         # another thread afterwards so it cannot hold either of them up.
         transcripts.add(text)
         if args.voice_prompt:
-            print(f"voice -> prompt: {prompt_state.set_prompt(text)!r}", flush=True)
+            if tuner is not None:
+                subject = dreamwave.dream_from_words(text)
+                if subject:
+                    tuner.go_live(subject, heard=text)
+                    if dream_world is not None and dream_world.active:
+                        dream_world.request_object(subject)
+                else:
+                    print("voice: heard, but not drawn onto anyone", flush=True)
+            else:
+                print(f"voice -> prompt: {prompt_state.set_prompt(text)!r}", flush=True)
         if banter is not None:
             banter.hear(text)
 
@@ -1447,13 +1633,22 @@ def main():
 
     idle_prompt = None
     if args.idle_after > 0:
-        idle_prompt = overlay.IdlePrompt(font_path=args.font, assets_dir=ASSETS_DIR,
-                                         after=args.idle_after)
+        if dream:
+            idle_prompt = overlay.IdlePrompt(
+                font_path=args.font, assets_dir=ASSETS_DIR, after=args.idle_after,
+                headline=dreamwave.IDLE_HEADLINE,
+                suggestions=dreamwave.IDLE_SUGGESTIONS,
+                accent=dreamwave.BLUSH, headline_colour=dreamwave.CREAM)
+        else:
+            idle_prompt = overlay.IdlePrompt(font_path=args.font, assets_dir=ASSETS_DIR,
+                                             after=args.idle_after)
 
     layout = overlay.layout_for(settings.stage_aspect)
     layout_aspect = settings.stage_aspect
     coin = None if args.no_coin else overlay.CoinRenderer(
-        ASSETS_DIR, relative_size=layout.coin_relative_size)
+        ASSETS_DIR, relative_size=layout.coin_relative_size * (1.6 if dream else 1.0),
+        faces=dreamwave.emblem_faces if dream else None)
+    COIN_SCALE = 1.6 if dream else 1.0     # the glowing centrepiece, so bigger
     text_renderer = None if args.no_text else overlay.TranscriptRenderer(
         font_path=args.font, assets_dir=ASSETS_DIR, layout=layout)
     if text_renderer is not None and text_renderer.font_path is None:
@@ -1472,25 +1667,44 @@ def main():
 
     commands = CommandReader(prompt_state, set_seed, quit_requested.set,
                              on_transcript=announce_transcript, settings=settings)
+    commands.tuner = tuner
     commands.start()
 
-    cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
     fullscreen = not args.windowed
-    cv2.setWindowProperty(
-        WINDOW, cv2.WND_PROP_FULLSCREEN,
-        cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL,
-    )
-    if not fullscreen:
-        size = args.display_size or (1280, 720)
-        cv2.resizeWindow(WINDOW, size[0], size[1])
-    cv2.waitKey(1)
+    if not args.headless:
+        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        cv2.setWindowProperty(
+            WINDOW, cv2.WND_PROP_FULLSCREEN,
+            cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL,
+        )
+        if not fullscreen:
+            size = args.display_size or (1280, 720)
+            cv2.resizeWindow(WINDOW, size[0], size[1])
+        cv2.waitKey(1)
+    started_at = time.time()
 
     print("controls (with the window focused): p=type a prompt  o=second prompt  "
           "c=settings  [/]=blend  s=reseed  r=rotate  h=preview  f=fullscreen  "
-          "q or esc=quit", flush=True)
+          + ("t=next station  w=dream world auto/on/off  " if dream else "")
+          + "q or esc=quit", flush=True)
     print(CommandReader.USAGE, flush=True)
 
-    background = overlay.MorphingCircles() if args.background == "circles" else None
+    if args.background != "circles":
+        background = None
+    elif dream:
+        background = dreamwave.DuskSky()
+    else:
+        background = overlay.MorphingCircles()
+    arch = dreamwave.Archway() if dream else None
+    static = dreamwave.Static() if dream else None
+    dial = dreamwave.RadioDial() if dream else None
+    glow = dreamwave.Glow() if dream else None
+    ribbon = footer = None
+    ribbon_for = None
+    world_built_for = None
+    backdrop = dreamwave.Backdrop() if dream else None
+    black_sky = None
+    last_presence = 0.0
 
     show_preview = False
     last_rotation = time.time()
@@ -1530,7 +1744,9 @@ def main():
         screen_w, screen_h = screen_size
         if canvas is None or canvas.shape[:2] != (screen_h, screen_w):
             canvas = np.zeros((screen_h, screen_w, 3), dtype=np.uint8)
-        if background is not None and settings.background_on:
+        if dream:
+            pass        # composed below, once the stage rect is known
+        elif background is not None and settings.background_on:
             background.update(now)
             np.copyto(canvas, background.render(screen_w, screen_h))
         elif not settings.background_on:
@@ -1542,11 +1758,51 @@ def main():
             layout_aspect = settings.stage_aspect
             layout = overlay.layout_for(layout_aspect)
             if coin is not None:
-                coin.relative_size = layout.coin_relative_size
+                coin.relative_size = layout.coin_relative_size * COIN_SCALE
             if text_renderer is not None:
                 text_renderer.layout = layout
-        sx, sy, stage_w, stage_h = overlay.stage_rect(screen_w, screen_h,
-                                                      settings.stage_aspect)
+        if dream:
+            sx, sy, stage_w, stage_h = dreamwave.dream_stage_rect(
+                screen_w, screen_h, settings.stage_aspect)
+        else:
+            sx, sy, stage_w, stage_h = overlay.stage_rect(screen_w, screen_h,
+                                                          settings.stage_aspect)
+
+        if presence is not None and now - last_presence >= 0.2:
+            last_presence = now
+            seen = None
+            if depth_source is not None and depth_source.fresh() \
+                    and settings.edge_style == KINECT_STYLE:
+                seen = depth_source.preview()
+                if seen is not None:
+                    presence.update_depth(seen, now)
+            if seen is None and capture is not None:
+                raw = capture.raw_frame()
+                if raw is not None:
+                    presence.update_camera(raw, now)
+        if tuner is not None:
+            tuner.update(now, present=presence.present,
+                         arrived=presence.take_arrival())
+        world_showing = False
+        if dream_world is not None:
+            mode = settings.world_mode
+            if mode == "auto":
+                want = tuner is not None and tuner.tunes % 2 == 1
+            else:
+                want = mode == "on"
+            worker.with_masks = mode != "off"
+            worker.mono_masks = want
+            dream_world.active = want
+            tunes = tuner.tunes if tuner is not None else 0
+            if mode != "off" and tunes != world_built_for:
+                # Build each station's place as it is tuned in, whether or not
+                # it is on show yet, so it is ready the moment it is wanted.
+                world_built_for = tunes
+                place = (tuner.station().place if tuner is not None
+                         else dreamwave.STATIONS[0].place)
+                dream_world.request_backdrop(place)
+            dream_world.update(now, dt, presence)
+            world_showing = want and dream_world.ready()
         stage_fit["size"] = (stage_w, stage_h)
         if stream.fade_step != settings.fade_step:
             stream.fade_step = settings.fade_step
@@ -1576,7 +1832,46 @@ def main():
             last_stage_frame = frame     # keeps id(frame) from being reused
         stage = last_stage
 
-        canvas[sy:sy + stage_h, sx:sx + stage_w] = stage
+        if dream:
+            person, person_alpha = stage, None
+            if stage.ndim == 3 and stage.shape[2] == 4:
+                person, person_alpha = stage[:, :, :3], stage[:, :, 3]
+            if world_showing:
+                pic = dream_world.render(np.ascontiguousarray(person), person_alpha, now)
+            else:
+                pic = person
+            level = tuner.static_level(now) if tuner is not None else 0.0
+            shown = static.apply(np.ascontiguousarray(pic), level, now) if level > 0 else pic
+            arch.prepare(screen_w, screen_h, (sx, sy, stage_w, stage_h))
+            if ribbon_for != (screen_w, screen_h, stage_w):
+                ribbon_for = (screen_w, screen_h, stage_w)
+                ribbon = np.asarray(dreamwave.ribbon_image(min(stage_w * 0.62,
+                                                               screen_w * 0.9)))
+                footer = dreamwave.footer_image(screen_h)
+            if background is not None and settings.background_on:
+                background.update(now)
+                sky = background.render(screen_w, screen_h)
+            else:
+                if black_sky is None or black_sky.shape[:2] != (screen_h, screen_w):
+                    black_sky = np.zeros((screen_h, screen_w, 3), np.uint8)
+                sky = black_sky
+            fh, fw = footer.shape[:2]
+            extras = [(footer, screen_w - fw - 12, screen_h - fh - 10)]
+            if tuner is not None or presence is not None:
+                dw, dh = dial.size_for(screen_w, screen_h, sx)
+                if tuner is not None:
+                    freq, name, on_air = tuner.display(now)
+                else:
+                    freq, name, on_air = 88.1, "private channel", False
+                dial_img = dial.render(dw, dh, freq, name, on_air,
+                                       presence.level if presence is not None else 0.0,
+                                       now)
+                pad = max(10, int(screen_h * 0.025))
+                extras.append((dial_img, pad, screen_h - dh - pad))
+            np.copyto(canvas, backdrop.compose(sky, arch, extras))
+            arch.paste(canvas, shown, (sx, sy, stage_w, stage_h))
+        else:
+            canvas[sy:sy + stage_h, sx:sx + stage_w] = stage[:, :, :3]
 
         # Text and coin go on after the stage, across the whole screen, so
         # transcripts sweep in over the background instead of being clipped to
@@ -1587,13 +1882,22 @@ def main():
             if live:
                 text_renderer.draw(canvas, live, now,
                                    stage_rect=(sx, sy, stage_w, stage_h),
-                                   coin_relative_size=(layout.coin_relative_size
+                                   coin_relative_size=(coin.relative_size
                                                        if coin is not None else 0))
         if idle_prompt is not None and voice is not None:
             idle_prompt.draw(canvas, now, transcripts.last_heard,
                              rect=(sx, sy, stage_w, stage_h))
         if coin is not None:
+            if glow is not None:
+                gx, gy, gsize = overlay.coin_centre((sx, sy, stage_w, stage_h),
+                                                    coin.relative_size)
+                on_air = tuner is not None and tuner.display(now)[2]
+                glow.draw(canvas, gx, gy, gsize * 0.9, now,
+                          boost=1.0 if on_air else 0.0)
             coin.draw(canvas, now, rect=(sx, sy, stage_w, stage_h))
+        if dream:
+            dreamwave.blit_rgba(canvas, ribbon, sx + stage_w // 2 - ribbon.shape[1] // 2,
+                                max(0, sy - int(ribbon.shape[0] * 0.42)))
         if show_preview:
             draw_preview(canvas, capture, settings.rotation, prompt_state, fps,
                          len(stream.pending), depth_source)
@@ -1601,7 +1905,10 @@ def main():
             draw_prompt_editor(canvas, editing[0], editing[1])
         panel.draw(canvas)
 
-        cv2.imshow(WINDOW, canvas)
+        if not args.headless:
+            cv2.imshow(WINDOW, canvas)
+        if args.run_for and now - started_at >= args.run_for:
+            quit_requested.set()
 
         if dump_dir is not None and now - last_dump >= args.dump_interval:
             last_dump = now
@@ -1622,7 +1929,11 @@ def main():
         remaining = TARGET_FRAME_SECONDS - (time.time() - now)
         # waitKeyEx, not waitKey: the arrow keys the panel uses do not survive
         # being masked to a byte.
-        raw_key = cv2.waitKeyEx(max(1, int(round(remaining * 1000))))
+        if args.headless:
+            time.sleep(max(0.001, remaining))
+            raw_key = -1
+        else:
+            raw_key = cv2.waitKeyEx(max(1, int(round(remaining * 1000))))
         key = raw_key & 0xFF if 0 <= raw_key < 0x110000 else -1
         frames_rendered += 1
 
@@ -1633,7 +1944,10 @@ def main():
             label, buffer = editing
             if key in (13, 10):                      # return: commit
                 if buffer.strip():
-                    if label == "prompt":
+                    if label == "prompt" and tuner is not None:
+                        tuner.hold(buffer.strip())
+                        composed = prompt_state.composed()
+                    elif label == "prompt":
                         composed = prompt_state.set_prompt(buffer.strip())
                     else:
                         composed = prompt_state.set_second_prompt(buffer.strip())
@@ -1667,6 +1981,11 @@ def main():
             print(f"rotation: {settings.rotation}", flush=True)
         elif key == ord("s"):
             set_seed(seed_box[0] + 1)
+        elif key == ord("w") and dream_world is not None:
+            settings.cycle_world(+1)
+        elif key == ord("t") and tuner is not None:
+            tuner.resume()
+            tuner.next_station(reason="by hand")
         elif key == ord("["):
             print(f"prompt: {prompt_state.set_blend(prompt_state.describe()[2] - 0.1)!r}",
                   flush=True)
@@ -1695,7 +2014,8 @@ def main():
         depth_source.close()
     if capture is not None:
         capture.close()
-    cv2.destroyAllWindows()
+    if not args.headless:
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

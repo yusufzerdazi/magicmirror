@@ -1,8 +1,11 @@
 #!/bin/bash
 # Start the magic mirror with one command.
 #
-#   ./start.sh                     # the event setup; uses the Kinect if plugged in
+#   ./start.sh                     # the event setup (DREAMWAVE, London Decompression
+#                                  # 2026); uses the Kinect if plugged in
 #   ./start.sh --no-kinect         # ignore the Kinect
+#   ./start.sh --simulate          # no hardware: a simulated camera and Kinect
+#   ./start.sh --theme mischief    # the original look
 #   ./start.sh --windowed          # anything else is passed to app.py
 #
 # With a Kinect attached the mirror runs under sudo, because claiming the sensor
@@ -21,14 +24,24 @@ FAR=${KINECT_FAR:-3000}
 EVENT=(--voice --voice-prompt)
 
 use_kinect=1
+simulate=0
 app_args=()
 for arg in "$@"; do
     if [ "$arg" = "--no-kinect" ]; then
         use_kinect=0
+    elif [ "$arg" = "--simulate" ]; then
+        simulate=1
     else
         app_args+=("$arg")
     fi
 done
+
+if [ "$simulate" = 1 ]; then
+    # Scripted people in front of a pretend camera and Kinect, for rehearsing
+    # without the rig. Voice still uses the real microphone.
+    exec "$PY" app.py "${EVENT[@]}" --camera sim --depth sim \
+        ${app_args[@]+"${app_args[@]}"}
+fi
 
 if [ "$use_kinect" = 1 ] && ioreg -p IOUSB -w0 -l 2>/dev/null | grep -q '"Xbox NUI Camera"'; then
     echo "kinect found — the mirror needs sudo to reach it"

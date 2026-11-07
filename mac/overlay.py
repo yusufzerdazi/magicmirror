@@ -458,8 +458,11 @@ class CoinRenderer:
     """
 
     def __init__(self, assets_dir, blue_rgb=COIN_BLUE_RGB, pink_rgb=COIN_PINK_RGB,
-                 relative_size=COIN_RELATIVE_SIZE):
+                 relative_size=COIN_RELATIVE_SIZE, faces=None):
         self.assets_dir = Path(assets_dir)
+        # Optional `faces(size) -> {"front": (bgr, alpha), "back": ...}` for a
+        # coin with artwork of its own rather than the tinted mischief logo.
+        self.face_factory = faces
         self.relative_size = relative_size
         self.blue_rgb = blue_rgb
         self.pink_rgb = pink_rgb
@@ -468,6 +471,11 @@ class CoinRenderer:
 
     def _ensure_size(self, size):
         if size == self._size:
+            return
+        if self.face_factory is not None:
+            made = self.face_factory(size)
+            self._faces = {"blue": made["front"], "pink": made["back"]}
+            self._size = size
             return
         alpha = load_mischief_alpha(self.assets_dir, size).astype(np.float32) / 255.0
         self._faces = {}
@@ -650,8 +658,11 @@ class IdlePrompt:
 
     def __init__(self, font_path=None, assets_dir=None,
                  headline=IDLE_HEADLINE, suggestions=IDLE_SUGGESTIONS,
-                 after=IDLE_AFTER_SECONDS):
+                 after=IDLE_AFTER_SECONDS, accent=COIN_PINK_RGB,
+                 headline_colour=(255, 255, 255)):
         self.font_path = find_font(font_path, assets_dir)
+        self.accent = tuple(accent)
+        self.headline_colour = tuple(headline_colour)
         self.headline = headline
         self.suggestions = tuple(suggestions) or ("",)
         self.after = after
@@ -733,8 +744,8 @@ class IdlePrompt:
         big = self._font(max(18, int(height * 0.085)))
         small = self._font(max(12, int(height * 0.042)))
         self._cache = (
-            self._render_line(self.headline, big, (255, 255, 255, 255)),
-            self._render_line(suggestion, small, COIN_PINK_RGB + (255,)),
+            self._render_line(self.headline, big, self.headline_colour + (255,)),
+            self._render_line(suggestion, small, self.accent + (255,)),
         )
         self._cache_key = key
         return self._cache

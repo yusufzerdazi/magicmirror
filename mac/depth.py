@@ -20,7 +20,7 @@ import time
 import cv2
 import numpy as np
 
-BACKENDS = ("off", "kinect", "kinect2", "server")
+BACKENDS = ("off", "kinect", "kinect2", "server", "sim")
 
 # Where the privileged helper publishes frames. Claiming the Kinect's USB
 # interfaces needs root on macOS — the sensor is a composite device and the
@@ -280,10 +280,16 @@ class DepthSource:
                 pass
         return read, close
 
+    def _open_sim(self):
+        import simulate
+        return simulate.kinect_reader()
+
     def try_start(self):
-        if self.backend not in ("kinect", "kinect2"):
+        openers = {"kinect": self._open_kinect_v1, "kinect2": self._open_kinect_v2,
+                   "sim": self._open_sim}
+        if self.backend not in openers:
             return False
-        opener = self._open_kinect_v1 if self.backend == "kinect" else self._open_kinect_v2
+        opener = openers[self.backend]
         try:
             self._read, self._close = opener()
         except ImportError as e:

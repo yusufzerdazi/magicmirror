@@ -1,5 +1,8 @@
 # magicmirror — local build
 
+> **London Decompression 2026:** `./start.sh` runs the DREAMWAVE edition. See
+> [DREAMWAVE](#dreamwave--london-decompression-2026) below.
+
 A single-process Apple Silicon build of the installation. It does locally what
 the hosted pair does over the network:
 
@@ -19,6 +22,105 @@ retuned overlay geometry. The local build follows the square one by default.
 
 Constants copied from either side are commented with where they came from, so
 the two can be kept in step.
+
+## DREAMWAVE — London Decompression 2026
+
+`./start.sh` now dresses the mirror for Decompression's 2026 theme, *Dreamwave:
+tune in, the dream is real*. It is the default (`--theme dreamwave`);
+`--theme mischief` brings back the original cat and coin.
+
+The mirror becomes a radio receiver for dreams, and the screen borrows the
+poster: a pink classical archway opening onto the picture, the coral "tune in"
+ribbon across its top, a dusk sky of paper clouds and gold constellations
+around it, and the glowing coin, now a gold eye on a radio mast.
+
+**Stations.** The dial in the corner is always tuned to a station, and each
+station is a dream the people in front of the mirror are redrawn into: Cloud
+Walkers, Radio Saints, Moon Ballroom, Deep Sea Static, Playa Mirage, The
+Hypnotist, Tin Radio Heart, Garden of Lost Keys (`dreamwave.STATIONS`). Every
+50 seconds or so it retunes. The needle sweeps, static rolls over the picture,
+and the prompt *morphs* between the two stations rather than cutting, because
+the embeddings are interpolated. An empty room channel-surfs faster (26s) to
+catch the eye, and **someone new walking up tunes a fresh station**, so each
+arrival gets a dream of their own.
+
+**On air.** Speaking into the handset goes live. The dial shows ON AIR with the
+words, which become the dream (the "turn me into…" is stripped), and the mirror
+answers in the earpiece like a late-night host from an alternate reality.
+After 45s it goes back to the stations. Greetings and questions are answered
+but not drawn. Anything that would have it draw people naked, sexualised or
+hurt is heard and shown, never rendered onto anyone: consent underpins the
+event, and the mirror redraws whoever walks past.
+
+**Dream World** (`world.py`) is the first step towards the "where it's going"
+part of the art application: a world built around the people in the room
+rather than a flat mirror.
+
+* Each station also has a *place*. It is generated, given depth by Depth
+  Anything, and drawn as a 2.5D scene with head-coupled parallax. Move sideways
+  and the near parts of the world slide past the far ones; step towards the
+  mirror and the camera dollies in.
+* People are cut out and composited *into* it, with a faint gold rim where
+  they meet it. With a Kinect the cut-out is metric: the empty room's depth is
+  learned through the night, including the floor that creeps into the working
+  volume and any furniture, and anything nearer than it is a person. Kinect IR
+  shadows are handled so that a patch of floor is never cut out as a person.
+  Without a Kinect, estimated depth does the job.
+* Spoken things become **objects in the world**. Say "a giant jellyfish" and
+  one is generated, cut out and set floating beside you at a depth of its own,
+  in front of you or behind you depending on where you stand. When nobody is
+  asking, ambient things drift in: a radio, a paper moon, a crow, a key.
+* `--world auto` (default) alternates mirror and world from one station to the
+  next; `on`/`off` hold it. `w` cycles it, and so does `world on` at the
+  terminal or the "dream world" row in the settings panel.
+
+All world generation runs on the inference thread between batches. The
+picture never stalls; a new place or object arrives a fraction of a second
+later.
+
+| key | |
+| --- | --- |
+| `t` | next station (also resumes the dial after a typed prompt) |
+| `w` | Dream World: auto / on / off |
+| `p` | type a prompt; this *holds* the dial on it until `t` |
+
+**Tuning the Kinect at the venue** no longer needs a restart: the settings panel
+(`c`) has `kinect near` / `kinect far` rows, 100mm a step. Bring `far` in until
+the back wall disappears from the `h` preview.
+
+### Rehearsing without the rig
+
+`simulate.py` scripts a scene: people walk in, dance, lean in towards the
+mirror, are joined by a friend and leave, with empty stretches in between. A
+simulated camera and Kinect both see it, and the Kinect side has the real
+sensor's faults (IR shadows, speckle holes along edges, floor creeping into
+the volume).
+
+```sh
+./start.sh --simulate                       # full event setup, fake camera + Kinect
+.venv/bin/python app.py --camera sim --depth sim --windowed
+.venv/bin/python simulate.py /tmp/sheet.png # contact sheet of the script itself
+```
+
+For automated runs, `--headless --run-for SECONDS --dump-frames DIR` renders
+without a window. Remarks can be piped in as `say …` lines on stdin:
+
+```sh
+(sleep 20; echo "say turn us into glowing jellyfish"; sleep 20; echo quit) |
+  .venv/bin/python app.py --camera sim --depth sim --headless \
+    --dump-frames /tmp/frames --voice-prompt --no-banter
+```
+
+### Measured (M5 Pro, simulated input, 1728x1080)
+
+| | warped | display |
+| --- | --- | --- |
+| sdxs-512 + Kinect, mirror | ~19-20 fps | ~48 fps |
+| sdxs-512 + Kinect, Dream World | ~18-19 fps | ~47 fps |
+| sdxs-512, camera only | ~14 fps | ~50 fps |
+| sdxl-turbo | ~7 fps | ~49 fps |
+
+A retune or a new world object costs a dip of a second or so.
 
 ## Setup
 
