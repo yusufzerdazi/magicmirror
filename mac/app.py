@@ -30,6 +30,7 @@ import depth as depth_module
 import devices
 import models as model_registry
 import overlay
+import upscale as upscale_module
 from moderation import SafetyChecker
 from prompting import PromptEncoder, PromptState
 from voice import BACKENDS as VOICE_BACKENDS, CHUNK_SECONDS, VoiceListener
@@ -102,11 +103,41 @@ def prepare_frame(frame_bgr, fit, stage_aspect=overlay.STAGE_ASPECT):
     return cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB)
 
 
-def fit_frame_to_stage(frame_bgr, width, height, fit):
-    """Put a warped frame on the stage, undoing `wide`'s squeeze."""
-    if fit == "wide":
+def fit_frame_to_stage(frame_bgr, width, height, fit, squeezed=True):
+    """Put a warped frame on the stage, undoing `wide`'s squeeze.
+
+    `squeezed` says whether frames still carry that squeeze; in the 16:10 frame
+    they have already been cropped to the stage's shape and must not be
+    stretched again.
+    """
+    if fit == "wide" and squeezed:
         return cv2.resize(frame_bgr, (width, height), interpolation=cv2.INTER_LINEAR)
     return overlay.cover_fit(frame_bgr, width, height)
+
+
+# Picture shapes. `square` shows the whole square the model renders; `16:10`
+# still gives the model a centre square of the camera, then cuts a full-width
+# 16:10 band out of what it draws, so the picture spans the screen with no
+# borders at the sides and nothing is stretched. 16:10 is the laptop display's
+# own shape, so it fills that screen edge to edge.
+WIDE_FRAME = "16:10"
+WIDE_ASPECT = 16.0 / 10.0
+FRAMES = ("square", WIDE_FRAME)
+
+
+def crop_band(rgb, aspect, bias=0.5):
+    """Cut the widest `aspect` band out of `rgb`.
+
+    `bias` places it vertically: 0 keeps the top of the square, 1 the bottom.
+    """
+    h, w = rgb.shape[:2]
+    if w / h >= aspect:
+        crop_w = int(round(h * aspect))
+        x0 = (w - crop_w) // 2
+        return rgb[:, x0:x0 + crop_w]
+    crop_h = int(round(w / aspect))
+    y0 = int(round((h - crop_h) * min(max(bias, 0.0), 1.0)))
+    return rgb[y0:y0 + crop_h]
 
 
 class TintCycle:
@@ -228,6 +259,10 @@ def warp_batch(pipe, encoder, rgbs, prompt, seed, device, strength, steps):
 # implemented below and switch on by being added back here — `hed` and `pidinet`
 # in particular read faces better than anything else tried, at about 6 fps.
 EDGE_STYLES = ("depth", "depth-raw", "sobel")
+# Real depth from a Kinect, via the helper. Only offered when one is attached,
+# and kept separate from `depth`/`depth-raw`, which always mean depth estimated
+# from the colour camera.
+KINECT_STYLE = "kinect"
 DISABLED_EDGE_STYLES = ("hed", "pidinet", "lineart", "lineart-anime",
                         "xdog", "canny")
 
@@ -420,9 +455,14 @@ def warmup(pipe, encoder, prompt, seed, device, strength, steps, batch_size):
 
 class InferenceWorker:
     def __init__(self, manager, capture, prompt_state, batch_size, settings,
-                 device, output_queue, tint=None, depth_source=None):
+                 device, output_queue, tint=None, depth_source=None,
+                 depth_near=depth_module.DEFAULT_NEAR_MM,
+                 depth_far=depth_module.DEFAULT_FAR_MM, upscaler=None):
         self.manager = manager
+        self.upscaler = upscaler
         self.capture = capture
+        self.depth_near = depth_near
+        self.depth_far = depth_far
         # When present, the ControlNet's line drawing comes from depth instead
         # of the colour camera.
         self.depth_source = depth_source
@@ -450,8 +490,21 @@ class InferenceWorker:
                 time.sleep(0.05)
                 continue
 
-            use_depth = self.depth_source is not None and _spec.control_repo
+            # A depth sensor stands in for the camera only where depth is what
+            # the model is being given. `sobel` still wants the colour image,
+            # and img2img models want the colour image full stop.
+            style = settings.edge_style
+            use_depth = (style == KINECT_STYLE and self.depth_source is not None
+                         and _spec.control_repo and self.depth_source.fresh())
+            if style == KINECT_STYLE and not use_depth:
+                # No live sensor: estimated depth from the camera is the nearest
+                # thing, and far better than freezing.
+                style = "depth-raw"
             source = self.depth_source if use_depth else self.capture
+            if source is None:
+                # Depth-only setup and the helper has gone quiet: wait for it.
+                time.sleep(0.05)
+                continue
             rgbs = source.latest_spaced(self.batch_size, self.last_batch_seconds)
             if rgbs is None:
                 time.sleep(0.005)
@@ -464,10 +517,11 @@ class InferenceWorker:
             t0 = time.time()
             try:
                 if _spec.control_repo:
+                    # The sensor hands over a finished depth map; everything
+                    # else is built from the colour frame.
                     warped = warp_batch_control(
                         pipe, encoder, rgbs, prompt, seed, self.device,
-                        settings.strength,
-                        None if use_depth else settings.edge_style)
+                        settings.strength, None if use_depth else style)
                 elif _spec.one_step:
                     warped = warp_batch_one_step(pipe, encoder, rgbs, prompt, seed,
                                                  self.device, settings.strength)
@@ -478,6 +532,16 @@ class InferenceWorker:
                 print(f"inference error: {e}", flush=True)
                 time.sleep(0.2)
                 continue
+
+            if settings.frame == WIDE_FRAME:
+                warped = [crop_band(w, WIDE_ASPECT, settings.crop_bias) for w in warped]
+            if self.upscaler is not None and settings.upscaler != "off":
+                h, w = warped[0].shape[:2]
+                try:
+                    warped = self.upscaler(warped, settings.upscaler,
+                                           upscale_module.output_size(w / h))
+                except Exception as e:
+                    print(f"upscale error: {e}", flush=True)
             self.last_batch_seconds = time.time() - t0
 
             for w in warped:
@@ -537,6 +601,10 @@ class FrameStream:
         # one inference batch, so the rate is measured over a window rather
         # than between consecutive frames.
         self._arrivals = collections.deque(maxlen=32)
+        # Optional per-frame transform, run once as each frame arrives — used
+        # to fit frames to the stage before they are blended, so a 1080p frame
+        # is not cross-faded and resized again on every display tick.
+        self.prepare = None
 
     def _drain(self):
         while True:
@@ -544,6 +612,8 @@ class FrameStream:
                 frame = self.source_queue.get_nowait()
             except queue.Empty:
                 break
+            if self.prepare is not None:
+                frame = self.prepare(frame)
             self.pending.append(frame)
             self._arrivals.append(self.clock())
         if len(self.pending) > self.max_buffer_size // 2:
@@ -598,6 +668,12 @@ class FrameStream:
                 return self.current
             self.incoming = self.pending[0]
             self.opacity = 1.0
+            if self.incoming.shape != self.current.shape:
+                # The frame shape or upscaler was changed: fade from the old
+                # picture resized, rather than failing to blend.
+                h, w = self.incoming.shape[:2]
+                self.current = cv2.resize(self.current, (w, h),
+                                          interpolation=cv2.INTER_LINEAR)
 
         if self.incoming is None:
             return self.current
@@ -632,16 +708,45 @@ class LiveSettings:
         self.seed = args.seed
         self.rotation = args.rotation
         self.capture_fit = args.capture_fit
+        self.has_kinect = False         # set once the depth source is up
         self.edge_style = (model_registry.MODELS[manager.name].edge_style
                            or EDGE_STYLES[0])
         self.rotate_minutes = args.rotate_models
         self.tint_on = not args.no_tint
         self.background_on = args.background == "circles"
         self.fade_step = None
-        self.stage_aspect = stage_aspect
+        # The --stage-aspect shape, used by the square frame.
+        self.base_aspect = stage_aspect
+        self.frame = args.frame
+        self.crop_bias = args.crop_bias
+        self.upscaler = args.upscaler
         self.pending_model = None
         self.on_seed = None
         self.on_framing = None
+        self.on_frame = None
+
+    @property
+    def stage_aspect(self):
+        """Shape of the picture on screen."""
+        return WIDE_ASPECT if self.frame == WIDE_FRAME else self.base_aspect
+
+    @property
+    def input_aspect(self):
+        """Shape of the camera/depth region the model is handed (squeezed into
+        its square). The 16:10 frame crops after the model, so it takes a square."""
+        return 1.0 if self.frame == WIDE_FRAME else self.base_aspect
+
+    def cycle_frame(self, delta):
+        self.frame = FRAMES[(FRAMES.index(self.frame) + delta) % len(FRAMES)]
+        if self.on_frame:
+            self.on_frame()
+
+    def cycle_upscaler(self, delta):
+        kinds = upscale_module.KINDS
+        self.upscaler = kinds[(kinds.index(self.upscaler) + delta) % len(kinds)]
+
+    def adjust_crop_bias(self, delta):
+        self.crop_bias = round(min(max(self.crop_bias + 0.05 * delta, 0.0), 1.0), 2)
 
     def switch_model(self, name):
         """Start loading `name` and take its own steps and strength with it."""
@@ -650,8 +755,9 @@ class LiveSettings:
             return False
         self.steps = spec.steps
         self.strength = spec.strength
-        if spec.edge_style:
-            self.edge_style = spec.edge_style
+        preferred = self.preferred_edges(spec)
+        if preferred:
+            self.edge_style = preferred
         self.pending_model = None
         return True
 
@@ -686,9 +792,20 @@ class LiveSettings:
         if self.on_framing:
             self.on_framing(self.capture_fit)
 
+    def edge_styles(self):
+        """What the panel offers: the Kinect first, when there is one."""
+        return ((KINECT_STYLE,) + EDGE_STYLES) if self.has_kinect else EDGE_STYLES
+
+    def preferred_edges(self, spec):
+        """A depth-hungry model gets the real sensor when one is attached."""
+        if spec.edge_style and spec.control_repo and self.has_kinect:
+            return KINECT_STYLE
+        return spec.edge_style
+
     def cycle_edges(self, delta):
-        index = (EDGE_STYLES.index(self.edge_style) + delta) % len(EDGE_STYLES)
-        self.edge_style = EDGE_STYLES[index]
+        styles = self.edge_styles()
+        current = styles.index(self.edge_style) if self.edge_style in styles else 0
+        self.edge_style = styles[(current + delta) % len(styles)]
 
     def toggle_tint(self):
         self.tint_on = not self.tint_on
@@ -733,7 +850,8 @@ class CommandReader:
 
     USAGE = ("commands (type in this terminal): <text> or 'prompt <text>' | "
              "'second <text>' | 'blend <0-1>' | 'seed <n>' | 'say <text>' | "
-             "'model <name>' | 'steps <n>' | 'strength <x>' | 'quit'")
+             "'model <name>' | 'steps <n>' | 'strength <x>' | "
+             "'frame square|16:10' | 'upscaler off|lanczos|anime|general' | 'quit'")
 
     def __init__(self, prompt_state, on_seed, on_quit, on_transcript=None,
                  settings=None):
@@ -810,6 +928,18 @@ class CommandReader:
                     print(f"strength: {self.settings.strength}", flush=True)
                 except ValueError:
                     print("strength takes a number", flush=True)
+            elif head_lower == "frame" and self.settings is not None:
+                if rest in FRAMES:
+                    while self.settings.frame != rest:
+                        self.settings.cycle_frame(+1)
+                else:
+                    print(f"frame: {self.settings.frame} — choose from "
+                          f"{', '.join(FRAMES)}", flush=True)
+            elif head_lower == "upscaler" and self.settings is not None:
+                if rest in upscale_module.KINDS:
+                    self.settings.upscaler = rest
+                print(f"upscaler: {self.settings.upscaler} — choose from "
+                      f"{', '.join(upscale_module.KINDS)}", flush=True)
             elif head_lower == "seed" and rest:
                 try:
                     self.on_seed(int(rest))
@@ -982,6 +1112,9 @@ def build_parser():
                              "depth.py --serve), which is what to use on macOS; "
                              "'kinect'/'kinect2' open the device in-process and "
                              "need the app itself to be root")
+    parser.add_argument("--edges", default=None, metavar="STYLE",
+                        help="control image to start on (kinect, depth, "
+                             "depth-raw, sobel); default follows the model")
     parser.add_argument("--depth-near", type=int, default=depth_module.DEFAULT_NEAR_MM,
                         metavar="MM", help="near edge of the working volume")
     parser.add_argument("--depth-far", type=int, default=depth_module.DEFAULT_FAR_MM,
@@ -1022,6 +1155,19 @@ def build_parser():
                         help="shape of the picture area: 1:1 (default) shows the "
                              "whole square the model renders; 16:9 matches the "
                              "hosted build; 'fill' uses the whole screen")
+    parser.add_argument("--frame", choices=FRAMES, default="square",
+                        help="square (default) shows the model's whole square; "
+                             "16:10 crops a full-width band out of it, so the "
+                             "picture spans the screen with no side borders")
+    parser.add_argument("--crop-bias", type=float, default=0.5, metavar="0-1",
+                        help="where the 16:10 band sits in the square: 0 top, "
+                             "0.5 centre (default), 1 bottom")
+    parser.add_argument("--upscaler", choices=upscale_module.KINDS, default="off",
+                        help="upscale frames to 1080p before display: lanczos "
+                             "(plain resize), anime (Real-ESRGAN animevideov3, "
+                             "fast, suits cartoon prompts), general "
+                             "(realesr-general-x4v3, sharper textures, ~2x the "
+                             "cost); default off")
     parser.add_argument("--background", choices=("circles", "black"),
                         default="circles",
                         help="what surrounds the picture: the mischief 3.0 "
@@ -1107,6 +1253,8 @@ def main():
 
     if args.batch < 1:
         raise SystemExit("--batch must be >= 1")
+    if not 0.0 <= args.crop_bias <= 1.0:
+        raise SystemExit("--crop-bias must be between 0 and 1")
     fade_step = None
     if str(args.fade_step).lower() != "auto":
         try:
@@ -1156,6 +1304,7 @@ def main():
 
     prompt_state = PromptState(args.prompt, args.second_prompt, args.blend)
     settings = LiveSettings(manager, prompt_state, args, stage_aspect)
+    print(f"frame: {settings.frame}, upscaler: {settings.upscaler}", flush=True)
     print(f"prompt: {prompt_state.composed()!r}", flush=True)
     print(f"batch {args.batch}, steps {settings.steps}, "
           f"strength {settings.strength}", flush=True)
@@ -1170,35 +1319,76 @@ def main():
             depth_source = depth_module.SocketDepthSource(SIZE)
         else:
             depth_source = depth_module.DepthSource(
-                args.depth, SIZE, stage_aspect, args.depth_near, args.depth_far)
+                args.depth, SIZE, settings.input_aspect, args.depth_near,
+                args.depth_far)
         if not depth_source.try_start():
             depth_source = None
+    if depth_source is not None:
+        settings.has_kinect = True
+        settings.edge_style = (settings.preferred_edges(
+            model_registry.MODELS[manager.name]) or settings.edge_style)
+        print(f"edges: {settings.edge_style}", flush=True)
+    if args.edges:
+        if args.edges not in settings.edge_styles():
+            raise SystemExit(f"--edges {args.edges} is not available; "
+                             f"choose from {', '.join(settings.edge_styles())}")
+        settings.edge_style = args.edges
 
     capture = None
     if camera_index is not None:
-        capture = WebcamCapture(camera_index, args.capture_fit, stage_aspect)
+        capture = WebcamCapture(camera_index, args.capture_fit,
+                                settings.input_aspect)
         capture.start()
         settings.on_framing = lambda fit: setattr(capture, "fit", fit)
     elif depth_source is None:
         raise SystemExit("--camera none needs a working --depth source")
+
+    def frame_changed():
+        # Both inputs crop to the model's input shape as frames arrive, so
+        # handing them the new one is all a switch takes.
+        for source in (capture, depth_source):
+            if source is not None and hasattr(source, "stage_aspect"):
+                source.stage_aspect = settings.input_aspect
+        print(f"frame: {settings.frame}", flush=True)
+    settings.on_frame = frame_changed
+
+    upscaler = upscale_module.Upscaler(device, dtype)
+    if settings.upscaler in upscale_module.WEIGHTS:
+        # Load (and if need be download) now rather than on the first batch.
+        upscaler.preload(settings.upscaler)
 
     output_queue = queue.Queue(maxsize=MAX_BUFFER_SIZE)
     worker = InferenceWorker(
         manager=manager,
         capture=capture,
         depth_source=depth_source,
+        depth_near=args.depth_near,
+        depth_far=args.depth_far,
         prompt_state=prompt_state,
         batch_size=args.batch,
         settings=settings,
         device=device,
         output_queue=output_queue,
         tint=TintCycle(),
+        upscaler=upscaler,
     )
     worker.start()
 
     settings.fade_step = fade_step
     stream = FrameStream(output_queue, fade_step=fade_step,
                          batch_size=args.batch)
+    # What the frames get fitted to as they arrive; kept current by the main
+    # loop, since the stage changes shape with the frame setting.
+    stage_fit = {"size": None}
+
+    def fit_to_stage(frame):
+        size = stage_fit["size"]
+        if size is None:
+            return frame
+        w, h = size
+        return fit_frame_to_stage(frame, w, h, settings.capture_fit,
+                                  squeezed=settings.frame != WIDE_FRAME)
+    stream.prepare = fit_to_stage
     transcripts = TranscriptFeed()
 
     banter = None
@@ -1260,7 +1450,8 @@ def main():
         idle_prompt = overlay.IdlePrompt(font_path=args.font, assets_dir=ASSETS_DIR,
                                          after=args.idle_after)
 
-    layout = overlay.layout_for(stage_aspect)
+    layout = overlay.layout_for(settings.stage_aspect)
+    layout_aspect = settings.stage_aspect
     coin = None if args.no_coin else overlay.CoinRenderer(
         ASSETS_DIR, relative_size=layout.coin_relative_size)
     text_renderer = None if args.no_text else overlay.TranscriptRenderer(
@@ -1306,6 +1497,7 @@ def main():
     last_seen_model = manager.name
     editing = None  # (label, buffer) while typing a prompt in the window
     canvas = None
+    last_stage = last_stage_key = last_stage_frame = None
     last_tick = time.time()
     frames_rendered = 0
     last_report = last_tick
@@ -1344,8 +1536,18 @@ def main():
         elif not settings.background_on:
             canvas[:] = 0
 
+        if settings.stage_aspect != layout_aspect:
+            # Frame shape switched from the panel: re-derive the overlay
+            # geometry for the new stage.
+            layout_aspect = settings.stage_aspect
+            layout = overlay.layout_for(layout_aspect)
+            if coin is not None:
+                coin.relative_size = layout.coin_relative_size
+            if text_renderer is not None:
+                text_renderer.layout = layout
         sx, sy, stage_w, stage_h = overlay.stage_rect(screen_w, screen_h,
-                                                      stage_aspect)
+                                                      settings.stage_aspect)
+        stage_fit["size"] = (stage_w, stage_h)
         if stream.fade_step != settings.fade_step:
             stream.fade_step = settings.fade_step
         frame = stream.tick(dt)
@@ -1358,8 +1560,21 @@ def main():
                 raw = depth_source.preview()
             frame = raw if raw is not None else np.zeros((SIZE, SIZE, 3), dtype=np.uint8)
 
-        stage = fit_frame_to_stage(frame, stage_w, stage_h, settings.capture_fit)
-        stage = overlay.rotate_stage(stage, settings.rotation)
+        # Between cross-fades the same frame comes back every tick; at 1080p
+        # re-fitting it 60 times a second is wasted work.
+        stage_key = (id(frame), stage_w, stage_h, settings.capture_fit,
+                     settings.frame, settings.rotation)
+        if stage_key != last_stage_key:
+            if frame.shape[:2] == (stage_h, stage_w):
+                stage = frame       # already fitted on arrival
+            else:
+                stage = fit_frame_to_stage(frame, stage_w, stage_h,
+                                           settings.capture_fit,
+                                           squeezed=settings.frame != WIDE_FRAME)
+            stage = overlay.rotate_stage(stage, settings.rotation)
+            last_stage, last_stage_key = stage, stage_key
+            last_stage_frame = frame     # keeps id(frame) from being reused
+        stage = last_stage
 
         canvas[sy:sy + stage_h, sx:sx + stage_w] = stage
 

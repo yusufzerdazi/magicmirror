@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 import models
+import upscale
 
 
 def app_edge_styles():
@@ -139,10 +140,19 @@ class ConfigPanel:
                   hint="cycle through the models on this interval",
                   options=[0, 5, 10, 15, 30, 45, 60]),
             Field("edges", lambda: st.edge_style, st.cycle_edges,
-                  hint="line drawing fed to the ControlNet models",
-                  options=list(app_edge_styles())),
+                  hint="control image for the ControlNet models",
+                  options=list(st.edge_styles())),
             Field("framing", lambda: st.capture_fit, st.cycle_framing,
                   options=["wide", "stretch", "crop"]),
+            Field("frame", lambda: st.frame, st.cycle_frame,
+                  hint="16:10 crops a full-width band from the square",
+                  options=["square", "16:10"]),
+            Field("crop position", lambda: st.crop_bias, st.adjust_crop_bias,
+                  fmt=lambda v: f"{v:.2f}", span=(0.0, 1.0),
+                  hint="where the 16:10 band sits: 0 top, 1 bottom"),
+            Field("upscaler", lambda: st.upscaler, st.cycle_upscaler,
+                  hint="upscale to 1080p before display",
+                  options=list(upscale.KINDS)),
             Field("rotation", lambda: st.rotation,
                   lambda d: st.set_rotation((st.rotation + 90 * d) % 360),
                   fmt=lambda v: f"{v}°", options=[0, 90, 180, 270]),

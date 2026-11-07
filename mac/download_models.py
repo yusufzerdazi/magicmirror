@@ -62,6 +62,15 @@ def fetch_preprocessors():
     snapshot_download("depth-anything/Depth-Anything-V2-Small-hf")
 
 
+def fetch_upscalers():
+    import upscale
+
+    print("\n=== upscalers", flush=True)
+    for kind in upscale.WEIGHTS:
+        print(f"downloading Real-ESRGAN {kind} weights...", flush=True)
+        upscale.fetch_weights(kind)
+
+
 def fetch_banter(model=None):
     import banter
 
@@ -107,6 +116,7 @@ def main():
         fetch_model(name)
     if any(registry.MODELS[n].control_repo for n in wanted):
         fetch_preprocessors()
+    fetch_upscalers()
     if not args.no_voice:
         fetch_voice()
         fetch_banter()

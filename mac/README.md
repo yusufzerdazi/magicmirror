@@ -30,6 +30,29 @@ python3 -m venv .venv
 
 ## Running
 
+The one command, which is what to use at the event:
+
+```sh
+./start.sh                       # voice on, Kinect if one is plugged in
+./start.sh --no-kinect           # ignore the Kinect
+./start.sh --windowed            # any other flags go straight to app.py
+KINECT_FAR=2500 ./start.sh       # tighter working volume for a small room
+./start.sh --frame 16:10 --upscaler anime  # full-screen 16:10, upscaled to 1080p
+```
+
+It is a single foreground Python process. If it finds a Kinect it runs the
+mirror under `sudo` — claiming the sensor needs root on macOS — and asks for your
+password; without one it runs as you.
+
+Running as root can leave root-owned files in the model cache, which would then
+stop a normal run from writing to it, so `start.sh` hands any such files back to
+you before starting and again on the way out. It also passes `HOME` through
+explicitly, so root uses your model cache instead of downloading everything
+again into its own. Run `download_models.py` as yourself beforehand so nothing
+needs fetching during a root run at all.
+
+Or directly:
+
 ```sh
 .venv/bin/python app.py                 # matches the hosted defaults
 .venv/bin/python app.py --voice         # + microphone, transcription, on-screen text
@@ -49,6 +72,9 @@ python3 -m venv .venv
 | seed, blend | as the keys do |
 | cross-fade | `auto` or a fixed step |
 | framing, rotation, tint, background | as the flags do |
+| frame | `square` or `16:10` (see [Frame and upscaler](#frame-and-upscaler)) |
+| crop position | where the 16:10 band sits in the square, 0 top to 1 bottom |
+| upscaler | `off`, `lanczos`, `anime`, `general` |
 
 Arrow keys are not delivered reliably by every HighGUI build, so `j`/`k` move
 and `h`/`l` change as well (`w`/`s` and `a`/`d` also work). If a key does arrive
@@ -63,6 +89,8 @@ model              # list the models and show the current one
 model sd-turbo     # switch
 steps 3
 strength 0.5
+frame 16:10        # or square
+upscaler anime     # off / lanczos / anime / general
 ```
 
 Switching model loads the new pipeline on a background thread and swaps it in
@@ -172,7 +200,8 @@ The `edges` row in the config panel chooses how the line drawing is made:
 
 | | | cost |
 | --- | --- | --- |
-| `depth` (default) | subject outline from estimated depth, detail from the colour image inside it | 14.1 fps |
+| `kinect` | real depth from a Kinect, background cut by distance — only offered with one attached | ~15 fps |
+| `depth` | subject outline from estimated depth, detail from the colour image inside it | 14.1 fps |
 | `depth-raw` | the depth map itself, no edge extraction | 14.7 fps |
 | `sobel` | gradient edges, equalised | 19.1 fps |
 
@@ -221,6 +250,70 @@ at 22.7 fps on an M3 Ultra, and that paper finds CoreML conversion to be the
 only UNet acceleration that actually helps on Apple Silicon — quantisation does
 not, because the work is compute-bound rather than bandwidth-bound. Nothing here
 uses CoreML; it is all PyTorch MPS.
+
+## Kinect
+
+A Kinect v1 gives the ControlNet models real depth, which beats estimated depth
+on exactly one thing that matters here: the cut-off is **metric**. Everything
+outside the working volume — the wall, the rest of the room — drops to black, so
+the person in front of the mirror stands out cleanly whatever is behind them.
+
+Claiming the Kinect's USB interfaces needs root on macOS (it is a composite
+device and the kernel holds its audio interface). `./start.sh` runs the whole
+mirror under `sudo` when a Kinect is plugged in, with `--depth kinect`, which
+opens the sensor inside the mirror process.
+
+There is also a split mode, where only a small helper runs as root and the
+mirror runs as you, reading depth over a local socket:
+
+```sh
+sudo .venv/bin/python depth.py --serve --near 600 --far 3000   # terminal 1
+.venv/bin/python app.py --depth server --voice --voice-prompt   # terminal 2
+```
+
+It keeps root out of the rest of the app, but it is two commands, and the first
+version of `start.sh` that tried to launch both — starting the helper under
+`sudo` in the background — could stall silently: a background job cannot read a
+password from the terminal, so if `sudo` asked again it simply stopped.
+
+The working volume, in millimetres, is the main thing to tune at a venue: bring
+the far edge in until the back wall disappears. With `start.sh` that is
+`KINECT_NEAR`/`KINECT_FAR`; directly it is `--depth-near`/`--depth-far`, or
+`--near`/`--far` on the helper. `h`
+shows the depth map the model is being given, which is the quickest way to frame
+the sensor. `sudo .venv/bin/python depth.py` on its own is a one-shot check that
+writes `/tmp/kinect-check.png`.
+
+The Kinect is **its own edge style, `kinect`**. It appears in the panel only when
+a Kinect is attached, and it is what sdxs starts on when there is one; without a
+Kinect sdxs starts on `depth-raw` as before. `depth` and `depth-raw` always mean
+depth *estimated* from the colour camera, so each style means one thing whatever
+is plugged in. `--edges` picks the starting style explicitly.
+
+If depth frames stop arriving for a second while `kinect` is selected — the
+sensor drops out, or the helper in split mode goes away — the mirror switches to
+`depth-raw` from the camera rather than freezing on the last frame, and picks the
+sensor up again when frames return.
+
+### Getting it running on macOS
+
+* **Use a USB 2.0 port.** On a USB 3 port or through a USB 3 hub the control
+  channel corrupts from the first command (`send_cmd: Bad tag`, truncated
+  registration reads). On USB 2.0 the stock Homebrew library works unmodified.
+* **Run the helper with `sudo`.** Without it the device opens and configures but
+  no depth frames ever arrive.
+* The 12V adapter must be connected. USB alone powers the motor, which is why
+  `Xbox NUI Motor` enumerates even when the camera cannot run.
+* A run killed mid-stream (`kill -9`, a crash) can leave a stale reply queued in
+  the device, and the next open reads it (`send_cmd: Bad cmd 03 != 16`). Unplug
+  and replug to clear it; stopping the helper with ctrl-c shuts it down cleanly.
+* The Python bindings are not on PyPI for macOS. Build `wrappers/python` from the
+  libfreenect source against Homebrew's library. Cython 3 breaks the shipped
+  `setup.py`, which probes a version attribute that no longer exists, so compile
+  `freenect.pyx` with a minimal `cythonize` setup instead. Remove the installed
+  `.so` before copying a rebuilt one over it: overwriting a library that has
+  already been loaded invalidates its cached code signature, and the next
+  `import freenect` is SIGKILLed with no message.
 
 ## Cameras and microphones
 
@@ -444,9 +537,42 @@ It is simulated and drawn at an eighth of the screen size and scaled up — an
 simulation ticks, so it costs about 3ms twenty times a second rather than on
 every display frame.
 
-The coin and the transcript paths follow the stage shape, as they do in the
-frontend: a square stage gets `mischief 3.0`'s 9% coin and paths at y=300 with a
-60 unit wave, a wide one gets the 16:9 build's 5% coin and paths at y=350/50.
+The coin and the transcript text follow the stage shape: a square stage gets
+`mischief 3.0`'s 9% coin, a wide one a 5.5% coin — about the same size on
+screen. Text is the same size in both.
+
+### Frame and upscaler
+
+`--frame 16:10` gives a picture that spans the full width of the screen with no
+borders at the sides. The model still renders its 512px square (from a centre
+square of the camera or Kinect), and a full-width 16:10 band — 512×320 — is cut
+out of what it draws. Nothing is stretched; the cost is the top and bottom of
+the square. `--crop-bias` (or *crop position* in the panel) moves the band: `0`
+keeps the top of the square, `0.5` (default) the middle, `1` the bottom. 16:10 is
+the MacBook display's own shape, so the picture fills it (bar a 2px strip the
+menu bar leaves); on a 16:9 TV it would be pillarboxed slightly at the sides.
+
+`--upscaler` takes the cropped frames up to 1080 pixels tall (1728×1080, or
+1080×1080 for the square) before they reach the screen:
+
+| `--upscaler` | what | cost per 16:10 frame | generated fps (sdxs, 16:10) |
+| --- | --- | --- | --- |
+| `off` (default) | the display resize does it | — | ~13.8 |
+| `lanczos` | plain CPU resize | ~1ms | ~13 |
+| `anime` | Real-ESRGAN `realesr-animevideov3` | ~13ms | ~11.5 |
+| `general` | Real-ESRGAN `realesr-general-x4v3` | ~21ms | ~10.5 |
+
+Both Real-ESRGAN models are the compact video networks (2.4MB and 4.7MB),
+batched on MPS; `anime` suits the flat cartoon prompts and is the one to pick
+by default, `general` keeps more texture on photographic ones. They sharpen
+edges and fur noticeably next to a resize. Weights download into
+`~/.cache/torch/hub` on first use (`download_models.py` fetches them ahead of
+time). The square frame costs roughly 1.6× as much to upscale as the 16:10 band,
+being 1.6× the pixels.
+
+Frames are fitted to the stage once as they arrive rather than on every display
+tick, so the cross-fade blends screen-sized frames and the display rate stays
+around 49fps with the upscaler on.
 
 ### Framing — `--capture-fit`
 

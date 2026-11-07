@@ -101,6 +101,35 @@ def raw_to_mm(raw):
     return mm
 
 
+def depth_map_from_mm(depth_mm, near=DEFAULT_NEAR_MM, far=DEFAULT_FAR_MM):
+    """Millimetres -> uint8 map, nearest white, outside the working volume black.
+
+    This is where a real depth sensor earns its place over estimated depth: the
+    cut-off is metric, so everything behind the person — the wall, the room —
+    drops to black and the subject stands out cleanly.
+    """
+    depth = np.asarray(depth_mm, dtype=np.float32)
+    valid = (depth > 0) & (depth >= near) & (depth <= far)
+    out = np.zeros(depth.shape, dtype=np.uint8)
+    # 1..255 for valid pixels, so a genuine far-edge reading is never mistaken
+    # for "no reading".
+    scaled = 1.0 + (far - depth) / max(1.0, float(far - near)) * 254.0
+    out[valid] = np.clip(scaled[valid], 1, 255).astype(np.uint8)
+    # Kinect speckle sits right on the silhouette edge.
+    return cv2.medianBlur(out, 5)
+
+
+def sketch_from_depth_map(depth_u8, near=DEFAULT_NEAR_MM, far=DEFAULT_FAR_MM):
+    """The contour line drawing, from a map made by depth_map_from_mm."""
+    u8 = np.asarray(depth_u8)
+    if u8.ndim == 3:
+        u8 = u8[:, :, 0]
+    mm = np.zeros(u8.shape, dtype=np.float32)
+    valid = u8 > 0
+    mm[valid] = far - (u8[valid].astype(np.float32) - 1.0) / 254.0 * (far - near)
+    return sketch_from_depth(mm, near, far)
+
+
 def sketch_from_depth(depth_mm, near=DEFAULT_NEAR_MM, far=DEFAULT_FAR_MM,
                       silhouette_weight=1.0, detail_weight=0.8):
     """Depth map in millimetres -> white-on-black line drawing.
@@ -174,6 +203,7 @@ class DepthSource:
         self.mirror = mirror
         self.buffer = collections.deque(maxlen=buffer_size)
         self.latest_raw = None
+        self.frames = 0
         self.lock = threading.Lock()
         self.stop_flag = threading.Event()
         self.thread = None
@@ -287,10 +317,12 @@ class DepthSource:
                                  interpolation=cv2.INTER_NEAREST)
             if self.mirror:
                 resized = cv2.flip(resized, 1)
-            sketch = sketch_from_depth(resized, self.near, self.far)
+            depth_map = cv2.cvtColor(depth_map_from_mm(resized, self.near, self.far),
+                                     cv2.COLOR_GRAY2RGB)
             with self.lock:
-                self.buffer.append((time.time(), sketch))
+                self.buffer.append((time.time(), depth_map))
                 self.latest_raw = resized
+                self.frames += 1
 
     def latest_spaced(self, n, span_seconds):
         """Same contract as WebcamCapture, so the worker can treat both alike."""
@@ -312,6 +344,10 @@ class DepthSource:
         step = (len(recent) - 1) / (n - 1)
         return [recent[int(round(i * step))][1] for i in range(n)]
 
+    def fresh(self):
+        with self.lock:
+            return bool(self.buffer) and time.time() - self.buffer[-1][0] < 1.0
+
     def preview(self):
         """A look at what the model is being given, for the 'h' overlay."""
         with self.lock:
@@ -328,7 +364,16 @@ class DepthSource:
 
 
 class SocketDepthSource:
-    """Client for the privileged helper; same interface as DepthSource."""
+    """Client for the privileged helper; same interface as DepthSource.
+
+    Reconnects on its own, so either end can be restarted mid-show, and reports
+    itself stale when frames stop arriving so the mirror can fall back to the
+    camera instead of freezing on the last depth frame.
+    """
+
+    # Frames older than this mean the helper has gone quiet.
+    STALE_SECONDS = 1.0
+    RETRY_SECONDS = 1.0
 
     def __init__(self, size, path=SOCKET_PATH, buffer_size=64):
         self.size = size
@@ -338,20 +383,26 @@ class SocketDepthSource:
         self.stop_flag = threading.Event()
         self.thread = None
         self._sock = None
+        self._last_frame = 0.0
+        self._connected = False
 
     def try_start(self):
-        import socket
-        try:
-            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self._sock.connect(self.path)
-        except Exception as e:
-            print(f"depth disabled — no helper at {self.path} ({e}).\n"
-                  f"  start it with:  sudo {__file__} --serve", flush=True)
-            return False
-        self.thread = threading.Thread(target=self._loop, daemon=True)
+        """Start the client; succeeds even if the helper is not up yet."""
+        self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
-        print(f"depth: connected to the helper at {self.path}", flush=True)
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not self._connected:
+            time.sleep(0.05)
+        if self._connected:
+            print(f"depth: connected to the helper at {self.path}", flush=True)
+        else:
+            print(f"depth: no helper at {self.path} yet — using the camera until "
+                  f"one appears.\n  start it with:  sudo .venv/bin/python depth.py "
+                  f"--serve", flush=True)
         return True
+
+    def fresh(self):
+        return time.time() - self._last_frame < self.STALE_SECONDS
 
     def _recv_exactly(self, count):
         chunks = []
@@ -363,24 +414,53 @@ class SocketDepthSource:
             count -= len(chunk)
         return b"".join(chunks)
 
-    def _loop(self):
+    def _run(self):
+        import socket
         import struct
+
+        announced_loss = False
         while not self.stop_flag.is_set():
             try:
-                header = self._recv_exactly(4)
-                if header is None:
-                    break
-                (length,) = struct.unpack("<I", header)
-                payload = self._recv_exactly(length)
-                if payload is None:
-                    break
-            except Exception as e:
-                print(f"depth helper connection lost: {e}", flush=True)
-                break
-            grey = np.frombuffer(payload, dtype=np.uint8).reshape(self.size, self.size)
-            sketch = cv2.cvtColor(grey, cv2.COLOR_GRAY2RGB)
-            with self.lock:
-                self.buffer.append((time.time(), sketch))
+                self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self._sock.connect(self.path)
+            except OSError:
+                self._sock = None
+                time.sleep(self.RETRY_SECONDS)
+                continue
+            if announced_loss:
+                print("depth: helper back, using depth again", flush=True)
+            self._connected = True
+            try:
+                while not self.stop_flag.is_set():
+                    header = self._recv_exactly(4)
+                    if header is None:
+                        break
+                    (length,) = struct.unpack("<I", header)
+                    payload = self._recv_exactly(length)
+                    if payload is None:
+                        break
+                    grey = np.frombuffer(payload, dtype=np.uint8).reshape(
+                        self.size, self.size)
+                    frame = cv2.cvtColor(grey, cv2.COLOR_GRAY2RGB)
+                    now = time.time()
+                    with self.lock:
+                        self.buffer.append((now, frame))
+                    self._last_frame = now
+            except OSError:
+                pass
+            finally:
+                self._connected = False
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+            if not self.stop_flag.is_set():
+                print("depth: lost the helper — falling back to the camera and "
+                      "retrying", flush=True)
+                announced_loss = True
+                with self.lock:
+                    self.buffer.clear()
+                time.sleep(self.RETRY_SECONDS)
 
     latest_spaced = DepthSource.latest_spaced
     preview = DepthSource.preview
@@ -395,7 +475,7 @@ class SocketDepthSource:
 
 
 def serve(backend="kinect", size=512, stage_aspect=1.0, near=DEFAULT_NEAR_MM,
-          far=DEFAULT_FAR_MM, path=SOCKET_PATH):
+          far=DEFAULT_FAR_MM, path=SOCKET_PATH, exit_with=None):
     """Own the sensor and publish sketches to any client that connects."""
     import os
     import socket
@@ -411,21 +491,46 @@ def serve(backend="kinect", size=512, stage_aspect=1.0, near=DEFAULT_NEAR_MM,
     server.bind(path)
     os.chmod(path, 0o777)   # the app runs unprivileged; the helper does not
     server.listen(1)
-    print(f"depth helper: publishing on {path}  (ctrl-c to stop)", flush=True)
+    server.settimeout(1.0)          # so the parent watch below gets a look in
+
+    def parent_alive():
+        # When started by the launcher the helper runs as root and outlives
+        # nothing: it goes when the process that started it goes, so quitting
+        # the mirror never leaves a root process holding the sensor.
+        if exit_with is None:
+            return True
+        try:
+            os.kill(exit_with, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True             # exists, just not ours to signal
+
+    print(f"depth helper: publishing on {path}, working volume {near}-{far}mm "
+          f"(ctrl-c to stop)", flush=True)
 
     try:
-        while True:
-            client, _ = server.accept()
-            print("depth helper: client connected", flush=True)
+        while parent_alive():
             try:
-                while True:
-                    sketch = source.preview()
-                    if sketch is None:
-                        time.sleep(0.01)
+                client, _ = server.accept()
+            except socket.timeout:
+                continue
+            client.settimeout(None)
+            print("depth helper: client connected", flush=True)
+            sent = -1
+            try:
+                while parent_alive():
+                    with source.lock:
+                        fresh = source.frames != sent and source.buffer
+                        frame = source.buffer[-1][1] if fresh else None
+                        count = source.frames
+                    if frame is None:
+                        time.sleep(0.005)      # the sensor runs at 30fps
                         continue
-                    payload = sketch[:, :, 0].tobytes()
+                    payload = frame[:, :, 0].tobytes()
                     client.sendall(struct.pack("<I", len(payload)) + payload)
-                    time.sleep(1 / 60.0)
+                    sent = count
             except (BrokenPipeError, ConnectionResetError):
                 print("depth helper: client disconnected", flush=True)
             finally:
@@ -433,6 +538,8 @@ def serve(backend="kinect", size=512, stage_aspect=1.0, near=DEFAULT_NEAR_MM,
     except KeyboardInterrupt:
         print("\ndepth helper: stopping", flush=True)
     finally:
+        if not parent_alive():
+            print("depth helper: the mirror has gone, stopping", flush=True)
         source.close()
         server.close()
         if os.path.exists(path):
@@ -501,7 +608,10 @@ if __name__ == "__main__":
     parser.add_argument("--near", type=int, default=DEFAULT_NEAR_MM)
     parser.add_argument("--far", type=int, default=DEFAULT_FAR_MM)
     parser.add_argument("--size", type=int, default=512)
+    parser.add_argument("--exit-with", type=int, default=None, metavar="PID",
+                        help="stop when this process exits (used by start.sh)")
     args = parser.parse_args()
     if args.serve:
-        sys.exit(serve(args.backend, args.size, 1.0, args.near, args.far))
+        sys.exit(serve(args.backend, args.size, 1.0, args.near, args.far,
+                       exit_with=args.exit_with))
     sys.exit(_self_test())

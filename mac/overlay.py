@@ -177,7 +177,11 @@ def layout_for(stage_aspect):
     """Square-ish stages get the square build's geometry, wide ones the 16:9."""
     if stage_aspect < 1.2:
         return Layout(0.09, 300.0, 60.0, 44.0)      # sized for the full-width sweep
-    return Layout(COIN_RELATIVE_SIZE, PATH_BASE_Y, PATH_AMPLITUDE, TEXT_SIZE_VB)
+    # Wide stages keep the square's text size (glyphs scale with stage height,
+    # so it comes out the same on screen) and a coin of about the same pixel
+    # size: the hosted build's 18 unit text and 5% coin were tuned for text
+    # confined to the picture, not sweeping in across the whole screen.
+    return Layout(0.055, PATH_BASE_Y, PATH_AMPLITUDE, 44.0)
 LEFT_PATH = [
     (0, PATH_BASE_Y),
     (100, PATH_BASE_Y + PATH_AMPLITUDE), (200, PATH_BASE_Y - PATH_AMPLITUDE), (300, PATH_BASE_Y),
